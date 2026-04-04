@@ -132,6 +132,12 @@ def compatible_stances_for_vision(vision: str) -> set[str] | None:
     return out if out else None
 
 
+def is_remote_csv(path: str) -> bool:
+    """True if ``path`` is an http(s) URL (pandas can read these directly)."""
+    p = (path or "").strip().lower()
+    return p.startswith("http://") or p.startswith("https://")
+
+
 def default_csv_path(project_root: str) -> str:
     """Prefer dashboard-local data (Streamlit / slim repo); fall back to legacy monorepo path."""
     dash_local = os.path.join(project_root, "dashboard", "data", "merged_analysis.csv")
@@ -258,7 +264,7 @@ def load_paragraph_table(
     extra = optional_extra_cols or []
     usecols = list(dict.fromkeys(base_cols + extra))
 
-    if not os.path.isfile(csv_path):
+    if not is_remote_csv(csv_path) and not os.path.isfile(csv_path):
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
     header = pd.read_csv(csv_path, nrows=0).columns.tolist()
@@ -894,11 +900,14 @@ def paragraph_duplicate_metrics(
     out["fuzzy_para_threshold"] = blob.get("fuzzy_para_threshold")
 
     if csv_path and blob.get("source_csv_mtime") is not None:
-        try:
-            mtime = os.path.getmtime(csv_path)
-            if abs(float(mtime) - float(blob["source_csv_mtime"])) > 1.5:
-                out["fuzzy_para_file_stale"] = True
-        except OSError:
+        if is_remote_csv(csv_path):
             out["fuzzy_para_file_stale"] = True
+        else:
+            try:
+                mtime = os.path.getmtime(csv_path)
+                if abs(float(mtime) - float(blob["source_csv_mtime"])) > 1.5:
+                    out["fuzzy_para_file_stale"] = True
+            except OSError:
+                out["fuzzy_para_file_stale"] = True
 
     return out

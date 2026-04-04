@@ -1494,6 +1494,20 @@ def _apply_sort(out: pd.DataFrame, sort_by: str, *, csv_path: str | None = None)
     return o
 
 
+def _dashboard_csv_path(project_root: str) -> str:
+    """Use ``DASHBOARD_CSV`` from the environment or Streamlit secrets; then default path."""
+    v = (os.environ.get("DASHBOARD_CSV") or "").strip()
+    if v:
+        return v
+    try:
+        v = (st.secrets.get("DASHBOARD_CSV") or "").strip()
+    except Exception:
+        v = ""
+    if v:
+        return v
+    return default_csv_path(project_root)
+
+
 def main() -> None:
     _page_icon = _BRAND_ICON_PATH if os.path.isfile(_BRAND_ICON_PATH) else "🔭"
     st.set_page_config(
@@ -1506,12 +1520,16 @@ def main() -> None:
     if not _check_password():
         return
 
-    csv_path = os.environ.get("DASHBOARD_CSV", default_csv_path(_PROJECT_ROOT))
+    csv_path = _dashboard_csv_path(_PROJECT_ROOT)
 
     try:
         df = _load_data(csv_path)
     except FileNotFoundError as e:
         st.error(str(e))
+        st.info(
+            "Set **DASHBOARD_CSV** in this app’s Streamlit **Secrets** (or your environment) to an "
+            "**https://** URL for `merged_analysis.csv`, or ship the file as `dashboard/data/merged_analysis.csv` in the repo."
+        )
         st.stop()
     except Exception as e:
         st.exception(e)
