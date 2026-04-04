@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+.venv*/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Secrets
+dashboard/.streamlit/secrets.toml
+.env
+.env.*
+
+# Monorepo / analysis trees (not part of Streamlit deployment repo)
+old_with future types/
+cue extraction/
+
+# Large dashboard extract (use DASHBOARD_CSV on Streamlit or place under dashboard/data/ locally)
+dashboard/data/merged_analysis.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/

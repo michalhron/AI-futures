@@ -1,0 +1,10 @@
+[theme]
+# Warm stone + slate blue (AI Vision Explorer)
+primaryColor = "#3d5a73"
+backgroundColor = "#faf8f5"
+secondaryBackgroundColor = "#f0ebe3"
+textColor = "#2d3436"
+base = "light"
+
+[server]
+headless = true
