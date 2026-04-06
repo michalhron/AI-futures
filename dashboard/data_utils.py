@@ -132,6 +132,66 @@ def compatible_stances_for_vision(vision: str) -> set[str] | None:
     return out if out else None
 
 
+def compatible_archetypes_for_stances_with_visions(
+    stances: set[str], visions: list[str]
+) -> set[str] | None:
+    """
+    Like ``compatible_archetypes_for_stances``, but restrict to one or more vision labels.
+    If ``visions`` is empty, any vision row counts (same as former ``vision="All"``).
+    """
+    if not stances:
+        return None
+    restrict = bool(visions)
+    out: set[str] = set()
+    for (v, s), arch in V2A_STANCED.items():
+        if restrict and v not in visions:
+            continue
+        if s in stances:
+            out.add(arch)
+    return out if out else None
+
+
+def compatible_archetypes_for_visions_union(visions: list[str]) -> set[str] | None:
+    """Union of archetypes that appear in the table for any of the given visions."""
+    if not visions:
+        return None
+    out: set[str] = set()
+    for (v, _s), arch in V2A_STANCED.items():
+        if v in visions:
+            out.add(arch)
+    return out if out else None
+
+
+def compatible_stances_for_archetypes_with_visions(
+    archetypes: set[str], visions: list[str]
+) -> set[str] | None:
+    """
+    Like ``compatible_stances_for_archetypes``, but restrict to the given vision list.
+    If ``visions`` is empty, any vision counts (same as ``vision="All"``).
+    """
+    if not archetypes:
+        return None
+    restrict = bool(visions)
+    out: set[str] = set()
+    for (v, s), arch in V2A_STANCED.items():
+        if restrict and v not in visions:
+            continue
+        if arch in archetypes:
+            out.add(s)
+    return out if out else None
+
+
+def compatible_stances_for_visions_union(visions: list[str]) -> set[str] | None:
+    """Union of stances that appear in the table for any of the given visions."""
+    if not visions:
+        return None
+    out: set[str] = set()
+    for (v, s), _arch in V2A_STANCED.items():
+        if v in visions:
+            out.add(s)
+    return out if out else None
+
+
 def is_remote_csv(path: str) -> bool:
     """True if ``path`` is an http(s) URL (pandas can read these directly)."""
     p = (path or "").strip().lower()
@@ -747,6 +807,9 @@ def paragraph_exact_duplicate_metrics(df: pd.DataFrame) -> dict[str, int]:
 
     - para_rows_total: row count
     - para_unique_norms: distinct normalized strings (including one bucket for empty)
+    - para_distinct_body_article_key: distinct (normalized body, article identity) pairs
+      (``article_key_series``: prefer ``__article_key``, else title ``||`` source_file).
+      Same paragraph text under a different article ID counts separately (reprints).
     - para_exact_extra_rows: rows − unique (total “copy” rows)
     - para_exact_multi_groups: normalized texts that appear on 2+ rows
     """
@@ -754,10 +817,13 @@ def paragraph_exact_duplicate_metrics(df: pd.DataFrame) -> dict[str, int]:
         return {
             "para_rows_total": 0,
             "para_unique_norms": 0,
+            "para_distinct_body_article_key": 0,
             "para_exact_extra_rows": 0,
             "para_exact_multi_groups": 0,
         }
     s = df["paragraph"].fillna("").astype(str).map(normalize_paragraph_strong)
+    ak = article_key_series(df).astype(str)
+    u_body_ak = int((s + "\x00" + ak).nunique())
     n = len(s)
     vc = s.value_counts()
     u = int(vc.size)
@@ -766,9 +832,35 @@ def paragraph_exact_duplicate_metrics(df: pd.DataFrame) -> dict[str, int]:
     return {
         "para_rows_total": n,
         "para_unique_norms": u,
+        "para_distinct_body_article_key": u_body_ak,
         "para_exact_extra_rows": extra,
         "para_exact_multi_groups": multi,
     }
+
+
+def dedupe_sorted_paragraph_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Collapse rows that share the same ``normalize_paragraph_strong(paragraph)`` text.
+
+    Keeps the **first** row of each group (order follows the already-sorted ``df``).
+    Adds:
+
+    - ``reprint_count``: rows in this frame with that normalized text
+    - ``_ave_para_norm``: normalized key (join to the second return for all appearances)
+
+    Returns:
+        ``(deduped_df, full_df_with_norm)`` — second value is a copy of ``df`` plus ``_ave_para_norm``.
+    """
+    if df is None or len(df) == 0:
+        e = df.copy() if df is not None else pd.DataFrame()
+        return e, e
+    full = df.copy()
+    pn = full["paragraph"].fillna("").astype(str).map(normalize_paragraph_strong)
+    full["_ave_para_norm"] = pn
+    counts = full.groupby("_ave_para_norm", sort=False).size()
+    dedup = full.drop_duplicates(subset=["_ave_para_norm"], keep="first").copy()
+    dedup["reprint_count"] = dedup["_ave_para_norm"].map(counts).astype(int)
+    return dedup, full
 
 
 def _paragraph_body_similarity_ratio(a: str, b: str) -> int:

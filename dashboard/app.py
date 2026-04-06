@@ -6,16 +6,52 @@ from __future__ import annotations
 
 import base64
 import calendar
+import contextlib
 import html
 import io
 import json
 import os
+import re
 import sys
 
-import altair as alt
-import matplotlib.pyplot as plt
-import pandas as pd
 import streamlit as st
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError as _e:
+    if getattr(_e, "name", None) == "matplotlib":
+        _root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        _py = os.path.join(_root, ".venv", "bin", "python")
+        st.set_page_config(page_title="AI Vision Explorer", layout="wide")
+        st.error(
+            "**Wrong Python environment.** `matplotlib` is missing because Streamlit was started with a "
+            "different Python than this repo’s **`.venv`** (where `pip install -r requirements.txt` was run). "
+            "Cursor sometimes uses **`.venv_preview`** — that is a separate env unless you install deps there too."
+        )
+        st.markdown(
+            f"- **Interpreter running Streamlit:** `{sys.executable}`  \n"
+            f"- **Project venv (recommended):** `{_py}`"
+        )
+        st.markdown("**Option A — use the project `.venv` (recommended):**")
+        st.code(
+            f'cd "{_root}"\n'
+            f'"{_py}" -m pip install -r requirements.txt\n'
+            f'"{_py}" -m streamlit run dashboard/app.py',
+            language="bash",
+        )
+        st.markdown("**Option B — keep your current interpreter, install deps into it:**")
+        st.code(
+            f'cd "{_root}"\n'
+            f'"{sys.executable}" -m pip install -r requirements.txt\n'
+            f'"{sys.executable}" -m streamlit run dashboard/app.py',
+            language="bash",
+        )
+        st.caption("From repo root you can also run: `./run_dashboard.sh` (always uses `.venv/bin/python`).")
+        st.stop()
+    raise
+
+import altair as alt
+import pandas as pd
 import streamlit.components.v1 as components
 
 # Project root = parent of dashboard/
@@ -25,14 +61,24 @@ if _PROJECT_ROOT not in sys.path:
 
 from collections import Counter  # noqa: E402
 
+from explore_filters import (  # noqa: E402
+    DASH_FILTER_FLASH_KEY,
+    FILTER_FOCUS_KEY as _FILTER_FOCUS_KEY,
+    SCROLL_SIDEBAR_KEY as _SCROLL_SIDEBAR_KEY,
+    AVE_SHOW_GUIDE_KEY,
+    apply_explore_filter,
+)
+from guide_content import render_guide_page  # noqa: E402
+
 from data_utils import (  # noqa: E402
     VISION_TO_ARCHETYPES,
     article_key_series,
     article_summary_stats,
-    compatible_archetypes_for_stances,
-    compatible_archetypes_for_vision,
-    compatible_stances_for_archetypes,
-    compatible_stances_for_vision,
+    dedupe_sorted_paragraph_rows,
+    compatible_archetypes_for_stances_with_visions,
+    compatible_archetypes_for_visions_union,
+    compatible_stances_for_archetypes_with_visions,
+    compatible_stances_for_visions_union,
     compatible_visions_for_filters,
     default_csv_path,
     distinctive_word_scores,
@@ -47,13 +93,131 @@ from data_utils import (  # noqa: E402
     word_weights_for_cloud_from_scores,
 )
 
+
+def _html_main_script(html: str) -> None:
+    """Inject HTML/JS into the real Streamlit app DOM.
+
+    ``st.components.v1.html`` renders inside a sandboxed iframe; accessing
+    ``window.parent.document`` often throws ``SecurityError``, so scripts that
+    style or navigate the app never ran. ``st.html(..., unsafe_allow_javascript=True)``
+    inserts into the main document (Streamlit >= 1.52).
+    """
+    html_fn = getattr(st, "html", None)
+    if html_fn is not None:
+        try:
+            html_fn(html, unsafe_allow_javascript=True)
+            return
+        except TypeError:
+            pass
+        except Exception:
+            pass
+    components.html(html, height=0)
+
+
+def _safe_markdown_html(html: str, *, prefer_stretch: bool = True) -> None:
+    """``unsafe_allow_html`` markdown; ``width=`` only exists on Streamlit ≥ ~1.52."""
+    if prefer_stretch:
+        try:
+            st.markdown(html, unsafe_allow_html=True, width="stretch")
+            return
+        except TypeError:
+            pass
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _render_snippet_block(html: str) -> None:
+    """Render one batched HTML block per page (``st.html`` when available, else markdown).
+
+    Huge HTML strings can **stall** the Streamlit session; truncate with a warning so the app
+    always returns a response (reduce **Per page** in List options to see full cards).
+    """
+    if not (html or "").strip():
+        return
+    html = (html or "").replace("\x00", "")
+    _max = 200_000
+    if len(html) > _max:
+        st.warning(
+            f"Snippet block is very large ({len(html):,} characters). "
+            f"Choose a smaller **Per page** value under **List options** so the page can render reliably."
+        )
+        html = html[:_max] + '<p class="ave-snippet-trunc">… truncated …</p>'
+    html_fn = getattr(st, "html", None)
+    if html_fn is not None:
+        try:
+            html_fn(html, width="stretch")
+            return
+        except Exception:
+            pass
+    _safe_markdown_html(html, prefer_stretch=True)
+
+
 _DASHBOARD_DIR = os.path.dirname(os.path.abspath(__file__))
 _BRAND_ICON_PATH = os.path.join(_DASHBOARD_DIR, "assets", "app_icon.png")
+_BRAND_SVG_PATH = os.path.join(_DASHBOARD_DIR, "assets", "app_icon.svg")
+_FAVICON_PATH = os.path.join(_DASHBOARD_DIR, "assets", "favicon.png")
 
 _PAGE_KEY = "dash_page_num"
 _FILTER_SIG_KEY = "dash_filter_sig"
-_FILTER_FOCUS_KEY = "filter_focus"
-_SCROLL_SIDEBAR_KEY = "dash_scroll_sidebar"
+_COLLAPSE_SIDEBAR_KEY = "dash_collapse_sidebar"
+
+# Multiselect selections are serialized using format_func output. Our ●/○ labels depend on
+# other filters, so when compatibility changes across reruns the frontend can send stale
+# formatted strings; Streamlit then returns "● Pioneer" instead of "Pioneer", and
+# .isin() matches nothing. Map back to real option values before widgets read state.
+_FILTER_MUTE_PREFIX_RE = re.compile(r"^[●○]\s+")
+# Some clients send other bullet / invisible chars ahead of the label.
+_FILTER_LEADING_JUNK_RE = re.compile(
+    r"^[\s\u200b\uFEFF\u2022\u2023\u25E6\u25CB\u25CF\u25AA\u25AB●○◦•\-\*]+"
+)
+
+
+def _sanitize_multiselect_against_options(selected: list, allowed: list[str]) -> list[str]:
+    """Map multiselect values (possibly ●/○ prefixed or unicode-mangled) to real CSV option strings."""
+    if not selected or not allowed:
+        return []
+    allow = frozenset(allowed)
+    by_lower = {a.lower(): a for a in allowed}
+    out: list[str] = []
+    for x in selected:
+        if x is None:
+            continue
+        try:
+            if pd.isna(x):
+                continue
+        except (ValueError, TypeError):
+            pass
+        s = str(x).strip()
+        if not s or s.lower() == "nan":
+            continue
+        resolved: str | None = None
+        for candidate in (
+            s,
+            _FILTER_MUTE_PREFIX_RE.sub("", s).strip(),
+            _FILTER_LEADING_JUNK_RE.sub("", s).strip(),
+            _FILTER_MUTE_PREFIX_RE.sub("", _FILTER_LEADING_JUNK_RE.sub("", s)).strip(),
+        ):
+            if not candidate:
+                continue
+            if candidate in allow:
+                resolved = candidate
+                break
+            low = candidate.lower()
+            if low in by_lower:
+                resolved = by_lower[low]
+                break
+        if resolved is not None:
+            out.append(resolved)
+    return list(dict.fromkeys(out))
+
+
+def _repair_format_multiselect_state(key: str, allowed: list[str]) -> None:
+    raw = st.session_state.get(key)
+    if not raw or not isinstance(raw, list):
+        return
+    fixed = _sanitize_multiselect_against_options(raw, allowed)
+    if fixed != raw:
+        st.session_state[key] = fixed
+
 
 # Distinct accent colors for multi-select compare (archetypes / stances)
 _COMPARE_COLORS = ("#1a3d5c", "#c45c26", "#2d6a4f", "#7b2cbf", "#c9184a", "#006d77", "#bc6c25")
@@ -100,10 +264,9 @@ def _nav_display_cb() -> None:
     st.session_state[_SCROLL_SIDEBAR_KEY] = True
 
 
-def _filter_open_cb() -> None:
-    """Focus the sidebar filter area (archetype / stance / vision first)."""
-    _set_filter_focus("primary")
-    st.session_state[_SCROLL_SIDEBAR_KEY] = True
+def _sidebar_apply_filters_cb() -> None:
+    """Sidebar primary action: hide the sidebar after the rerun (filters already apply live)."""
+    st.session_state[_COLLAPSE_SIDEBAR_KEY] = True
 
 
 def _trunc_ui(s: str, n: int = 26) -> str:
@@ -119,6 +282,42 @@ def _fmt_multi_chip(selected: list[str], *, max_len: int = 28) -> str:
     return _trunc_ui(s, max_len)
 
 
+def _apply_ave_explore_query_param(raw: str) -> bool:
+    """Parse legacy ``ave_explore=arch:Pioneer`` URLs (full reload may drop sign-in — prefer in-app Explore buttons)."""
+    from urllib.parse import unquote
+
+    s = unquote(raw).strip()
+    if not s or ":" not in s:
+        return False
+    kind, _, rest = s.partition(":")
+    return apply_explore_filter(kind, rest.strip())
+
+
+def _normalize_dash_visions(raw: object) -> list[str]:
+    """Session value for vision filter: list of labels, or legacy str 'All' / single type."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [] if raw == "All" else [raw]
+    if isinstance(raw, list):
+        return [str(x) for x in raw if x is not None and str(x).strip()]
+    return []
+
+
+def _time_chip_display(date_label: str, *, max_len: int = 18) -> str:
+    """Single-line time summary for the chip (full range stays in the sidebar)."""
+    s = str(date_label).replace(" → ", "–").replace("→", "–").strip()
+    # Prefer YYYY–YYYY so the value stays one line inside a fixed-height pill
+    years = re.findall(r"\b(19\d{2}|20\d{2})\b", s)
+    if len(years) >= 2:
+        y0, y1 = years[0], years[-1]
+        if y0 != y1:
+            s = f"{y0}–{y1}"
+        else:
+            s = y0
+    return _trunc_ui(s, max_len)
+
+
 def _chip_panel_line(
     label: str,
     value: str,
@@ -126,9 +325,10 @@ def _chip_panel_line(
     emoji: str = "",
     max_len: int = 26,
 ) -> str:
-    """Two-line chip label: category (+ optional emoji, first line via CSS) + prominent value."""
+    """Two-line chip label: `st.button` renders labels as Markdown — use GFM hard break (two spaces + newline)."""
     head = f"{emoji} {label}".strip() if emoji else label
-    return f"{head}\n{_trunc_ui(value, max_len)}"
+    val = _trunc_ui(value, max_len)
+    return f"{head}  \n{val}"
 
 
 def _apply_filters_unsorted(
@@ -136,7 +336,7 @@ def _apply_filters_unsorted(
     time_mode: str,
     archetypes: list,
     stances: list,
-    vision: str,
+    visions: list[str],
     pub: str,
     kw: str,
     match_all: bool,
@@ -148,8 +348,8 @@ def _apply_filters_unsorted(
         out = out[out["archetype"].isin(archetypes)]
     if stances:
         out = out[out["majority_stance"].isin(stances)]
-    if vision != "All":
-        out = out[out["future_type_prediction"] == vision]
+    if visions:
+        out = out[out["future_type_prediction"].isin(visions)]
     if pub != "All":
         out = out[out["publication"] == pub]
     terms = parse_keywords(kw)
@@ -178,11 +378,46 @@ def _apply_time_range_filter(df: pd.DataFrame, time_mode: str) -> pd.DataFrame:
 
 
 def _brand_icon_data_uri() -> str:
-    """PNG as data URI for inline HTML (Streamlit markdown cannot load local file URLs)."""
+    """SVG (preferred) or PNG as data URI for inline HTML (Streamlit cannot load local file URLs)."""
+    if os.path.isfile(_BRAND_SVG_PATH):
+        with open(_BRAND_SVG_PATH, "rb") as f:
+            return "data:image/svg+xml;base64," + base64.b64encode(f.read()).decode("ascii")
     if not os.path.isfile(_BRAND_ICON_PATH):
         return ""
     with open(_BRAND_ICON_PATH, "rb") as f:
         return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+
+
+def _explorer_title_bar_html(icon_uri: str) -> str:
+    """Brand + title strip (used alone or inside :func:`_explorer_title_bar_row_html`)."""
+    brand = ""
+    if os.path.isfile(_BRAND_SVG_PATH):
+        with open(_BRAND_SVG_PATH, encoding="utf-8") as f:
+            _svg_raw = f.read().strip()
+        _svg_raw = _svg_raw.replace("<svg", '<svg class="ave-brand-mark"', 1)
+        brand = f'<span class="ave-strip-brand-wrap">{_svg_raw}</span>'
+    elif icon_uri:
+        safe = html.escape(icon_uri, quote=True)
+        brand = (
+            f'<span class="ave-strip-brand-wrap ave-strip-brand-wrap--img">'
+            f'<img class="ave-strip-icon" src="{safe}" alt="" /></span>'
+        )
+    if brand:
+        inner = f'<span class="ave-main-strip-inner">{brand} <strong>AI Vision Explorer</strong></span>'
+    else:
+        inner = '<span class="ave-main-strip-inner">🔭 &nbsp; <strong>AI Vision Explorer</strong></span>'
+    return f'<div class="ave-main-strip ave-main-strip--in-expl-row">{inner}</div>'
+
+
+def _explorer_title_bar_row_html(icon_uri: str) -> str:
+    """One flex row: title strip + **Explanations** (``?guide=1`` — same as legacy guide URLs; avoids Streamlit column wrap bugs)."""
+    strip = _explorer_title_bar_html(icon_uri)
+    return (
+        f'<div class="ave-expl-title-unified">'
+        f'<div class="ave-expl-title-unified__left">{strip}</div>'
+        f'<a class="ave-expl-title-unified__link" href="?guide=1" aria-label="Open Explanations">Explanations</a>'
+        f"</div>"
+    )
 
 
 def _password_from_dashboard_secrets_file() -> str:
@@ -218,28 +453,53 @@ def _inject_login_css() -> None:
     st.markdown(
         """
 <style>
-  .ave-login-outer { max-width: 440px; margin: 0 auto; padding: 1.5rem 1rem 2rem 1rem; }
-  .ave-login-card {
+  /*
+    Login shell: Streamlit container (key ave_login_shell) wraps hero HTML + password + button
+    so the form stays the same width as the logo card (widgets were full column width before).
+  */
+  [data-testid="stMain"] [class*="st-key-ave_login_shell"] {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 520px;
+    margin-left: auto !important;
+    margin-right: auto !important;
+    padding: 2rem 1.75rem 1.6rem 1.75rem !important;
     background: linear-gradient(180deg, #ffffff 0%, #f7f4ef 100%);
     border: 1px solid #e0d8ce;
-    border-radius: 16px;
-    padding: 1.75rem 1.5rem 1.5rem 1.5rem;
-    box-shadow: 0 6px 28px rgba(35, 48, 58, 0.1);
+    border-radius: 20px;
+    box-shadow: 0 8px 36px rgba(35, 48, 58, 0.12);
   }
-  .ave-login-brand { display: flex; align-items: flex-start; gap: 0.85rem; margin-bottom: 1.15rem; }
+  [data-testid="stMain"] [class*="st-key-ave_login_shell"] .stTextInput,
+  [data-testid="stMain"] [class*="st-key-ave_login_shell"] .stButton {
+    width: 100%;
+  }
+  .ave-login-hero {
+    text-align: center;
+    margin-bottom: 1.35rem;
+  }
   .ave-login-logo {
-    width: 52px; height: 52px; min-width: 52px;
-    border-radius: 14px;
+    width: 132px; height: 132px; min-width: 132px;
+    margin: 0 auto 1.15rem auto;
+    border-radius: 28px;
     background: linear-gradient(145deg, #f7f4ef, #e3eef6);
     border: 1px solid #c5d8e8;
+    box-shadow: 0 4px 20px rgba(47, 74, 94, 0.12);
     display: flex; align-items: center; justify-content: center;
     overflow: hidden;
   }
-  .ave-login-logo img { width: 100%; height: 100%; object-fit: contain; display: block; border-radius: 10px; }
-  .ave-login-title { font-size: 1.4rem; font-weight: 800; color: #2f4a5e; margin: 0; line-height: 1.2; letter-spacing: -0.02em; }
-  .ave-login-tagline { font-size: 0.9rem; color: #5c6670; margin: 0.45rem 0 0 0; line-height: 1.5; }
-  .ave-login-divider { height: 1px; background: rgba(0,0,0,0.06); margin: 1.1rem 0 1rem 0; }
-  .ave-login-actions p { font-size: 0.82rem; color: #6b7280; margin: 0 0 0.5rem 0; }
+  .ave-login-logo img {
+    width: 100%; height: 100%; object-fit: contain; display: block; border-radius: 22px; padding: 6px;
+    transition: transform 0.2s ease;
+  }
+  .ave-login-logo:hover img { transform: scale(1.05); }
+  .ave-login-logo.ave-login-logo--emoji { font-size: 4.25rem; line-height: 1; padding: 0; }
+  .ave-login-title {
+    font-size: 1.65rem; font-weight: 800; color: #2f4a5e;
+    margin: 0; line-height: 1.2; letter-spacing: -0.03em;
+  }
+  .ave-login-tagline { font-size: 0.95rem; color: #5c6670; margin: 0.65rem 0 0 0; line-height: 1.55; text-align: left; }
+  .ave-login-divider { height: 1px; background: rgba(0,0,0,0.06); margin: 1.15rem 0 1rem 0; }
+  .ave-login-actions p { font-size: 0.82rem; color: #6b7280; margin: 0 0 0.75rem 0; }
 </style>
         """,
         unsafe_allow_html=True,
@@ -262,46 +522,47 @@ def _check_password() -> bool:
     logo_block = (
         f'<div class="ave-login-logo"><img src="{icon_uri}" alt="" /></div>'
         if icon_uri
-        else '<div class="ave-login-logo" style="font-size:1.6rem">🔭</div>'
+        else '<div class="ave-login-logo ave-login-logo--emoji" aria-hidden="true">🔭</div>'
     )
-    _, mid, _ = st.columns([1, 2.15, 1])
+    _, mid, _ = st.columns([1, 2.35, 1])
     with mid:
-        st.markdown(
-            f"""
-<div class="ave-login-outer">
-  <div class="ave-login-card">
-    <div class="ave-login-brand">
-      {logo_block}
-      <div>
-        <p class="ave-login-title">AI Vision Explorer</p>
-        <p class="ave-login-tagline">
-          Explore AI-related paragraphs from <strong>HBR</strong> and <strong>MIT Sloan Management Review</strong>—filter by time,
-          archetype, stance, and vision; scan trends; and read curated excerpts.
-        </p>
-      </div>
-    </div>
-    <div class="ave-login-divider" aria-hidden="true"></div>
-    <div class="ave-login-actions">
-      <p>Sign in with the shared password.</p>
-    </div>
-  </div>
+        with st.container(key="ave_login_shell"):
+            st.markdown(
+                f"""
+<div class="ave-login-hero">
+  {logo_block}
+  <p class="ave-login-title">AI Vision Explorer</p>
+  <p class="ave-login-tagline">
+    Explore AI-related paragraphs from <strong>HBR</strong> and <strong>MIT Sloan Management Review</strong>—filter by time,
+    archetype, stance, and vision; scan trends; and read curated excerpts.
+  </p>
 </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        pw = st.text_input(
-            "Password",
-            type="password",
-            autocomplete="current-password",
-            label_visibility="visible",
-            placeholder="Enter password",
-        )
-        if st.button("Sign in", type="primary", use_container_width=True):
-            if pw and pw == expected:
-                st.session_state._auth_ok = True
-                st.rerun()
-            else:
-                st.warning("Incorrect password. Try again.")
+<div class="ave-login-divider" aria-hidden="true"></div>
+<div class="ave-login-actions">
+  <p>Sign in with the shared password.</p>
+</div>
+                """,
+                unsafe_allow_html=True,
+            )
+            pw = st.text_input(
+                "Password",
+                type="password",
+                autocomplete="current-password",
+                label_visibility="visible",
+                placeholder="Enter password",
+                key="ave_login_pw",
+            )
+            if st.button(
+                "Access the dashboard",
+                type="primary",
+                use_container_width=True,
+                key="ave_login_submit",
+            ):
+                if pw and pw == expected:
+                    st.session_state._auth_ok = True
+                    st.rerun()
+                else:
+                    st.warning("Incorrect password. Try again.")
     return False
 
 
@@ -424,8 +685,13 @@ def _monthly_filter_breakdown_by_values(
     return pd.DataFrame(rows)
 
 
-def _compare_accent_for_row(row: pd.Series, archetypes: list[str], stances: list[str]) -> str | None:
-    """Left-border color when multiple archetypes or multiple stances are selected."""
+def _compare_accent_for_row(
+    row: pd.Series,
+    archetypes: list[str],
+    stances: list[str],
+    visions: list[str],
+) -> str | None:
+    """Left-border color when multiple archetypes, stances, or vision types are selected."""
     if len(archetypes) > 1:
         av = row.get("archetype")
         if pd.isna(av) or str(av) not in archetypes:
@@ -438,17 +704,23 @@ def _compare_accent_for_row(row: pd.Series, archetypes: list[str], stances: list
             return None
         ix = sorted(str(x) for x in stances).index(str(sv))
         return _COMPARE_COLORS[ix % len(_COMPARE_COLORS)]
+    if len(visions) > 1:
+        vv = row.get("future_type_prediction")
+        if pd.isna(vv) or str(vv) not in visions:
+            return None
+        ix = sorted(str(x) for x in visions).index(str(vv))
+        return _COMPARE_COLORS[ix % len(_COMPARE_COLORS)]
     return None
 
 
-def _snippet_item_html(
+def _snippet_card_inner_html(
     row: pd.Series,
     *,
-    global_index: int,
     archetypes: list[str],
     stances: list[str],
+    visions: list[str],
 ) -> str:
-    """One snippet row: large dim index outside the card (left), then the white card."""
+    """White card only (title, meta, body) — used by HTML snippet rows and Streamlit-column rows."""
     title = str(row.get("title", "") or "Untitled")[:200]
     dt = row.get("date", "")
     dt_s = pd.Timestamp(dt).strftime("%Y-%m-%d") if pd.notna(dt) else ""
@@ -463,29 +735,194 @@ def _snippet_item_html(
         f"<strong>Archetype:</strong> {html.escape(arch_s)} · "
         f"<strong>Stance:</strong> {html.escape(st_s)}"
     )
-    _accent = _compare_accent_for_row(row, archetypes, stances)
+    _accent = _compare_accent_for_row(row, archetypes, stances, visions)
+    rc = max(1, int(row.get("reprint_count", 1)))
+    stack_n = min(rc, 5)
+    stack_cls = f" ave-snippet-card--stack{stack_n}" if rc > 1 else ""
     open_div = (
-        f'<div class="ave-snippet-card" style="border-left:4px solid {_accent}">'
+        f'<div class="ave-snippet-card{stack_cls}" style="border-left:4px solid {_accent}">'
         if _accent
-        else '<div class="ave-snippet-card">'
+        else f'<div class="ave-snippet-card{stack_cls}">'
     )
     return (
-        f'<div class="ave-snippet-item" role="article" aria-label="Snippet {global_index}">'
-        f'<div class="ave-snippet-num-col" aria-hidden="true">'
-        f'<span class="ave-snippet-num">{global_index}</span></div>'
         f'<div class="ave-snippet-card-wrap">'
         f"{open_div}"
         f'<div class="ave-snippet-title">{html.escape(title)}</div>'
         f'<div class="ave-snippet-meta">{meta_html}</div>'
         f'<div class="ave-snippet-body">{html.escape(para_raw)}</div>'
-        f"</div></div></div>"
+        f"</div></div>"
     )
+
+
+def _snippet_item_html(
+    row: pd.Series,
+    *,
+    global_index: int,
+    archetypes: list[str],
+    stances: list[str],
+    visions: list[str],
+    reprint_count: int = 1,
+) -> str:
+    """One snippet row: large dim index outside the card (left), then the white card (static HTML only).
+
+    **Dedupe** mode with reprints uses :func:`_render_snippet_row_streamlit` instead (×N is a real
+    ``st.button`` next to the index). This helper stays for non-dedupe batched ``st.html`` grids.
+    """
+    rc = max(1, int(reprint_count))
+    card_inner = _snippet_card_inner_html(row, archetypes=archetypes, stances=stances, visions=visions)
+    if rc <= 1:
+        _badge = ""
+    else:
+        _badge = (
+            f'<span class="ave-snippet-reprint-badge" title="This paragraph text appears {rc} times in the current filter">'
+            f"×{rc}</span>"
+        )
+    return (
+        f'<div class="ave-snippet-item" role="article" aria-label="Snippet {global_index}">'
+        f'<div class="ave-snippet-num-col" aria-hidden="true">'
+        f'<span class="ave-snippet-num">{global_index}</span>{_badge}</div>'
+        f"{card_inner}</div>"
+    )
+
+
+def _render_snippet_row_streamlit(
+    row: pd.Series,
+    *,
+    global_index: int,
+    reprint_button_key: str,
+    archetypes: list[str],
+    stances: list[str],
+    visions: list[str],
+    para_norm: str | None,
+) -> None:
+    """One snippet row: index + optional ×N ``st.button`` + card via ``st.html`` (dedupe / reprints)."""
+    _rc = max(1, int(row.get("reprint_count", 1)))
+    # Narrow index rail + wide card; gap separates index from card.
+    try:
+        idx_col, card_col = st.columns([1, 14], gap="large")
+    except TypeError:
+        idx_col, card_col = st.columns([1, 14])
+    with idx_col:
+        # Keyed container so CSS can always find the rail (Streamlit may wrap Column > VB with extra nodes).
+        _rail_wrap_key = f"idxrail_{reprint_button_key}"
+
+        def _rail_content() -> None:
+            st.markdown(
+                f'<div class="ave-snippet-num-col ave-snippet-num-col--streamlit ave-snippet-index-rail">'
+                f'<span class="ave-snippet-num">{global_index}</span></div>',
+                unsafe_allow_html=True,
+            )
+            if para_norm is None or _rc <= 1:
+                return
+            try:
+                _rp_click = st.button(
+                    f"\u00d7{_rc}",
+                    key=reprint_button_key,
+                    help=f"Show all {_rc} appearances of this paragraph in the current filter",
+                    type="tertiary",
+                )
+            except TypeError:
+                _rp_click = st.button(
+                    f"\u00d7{_rc}",
+                    key=reprint_button_key,
+                    help=f"Show all {_rc} appearances of this paragraph in the current filter",
+                    type="secondary",
+                )
+            if _rp_click:
+                st.session_state["ave_reprint_open_pn"] = para_norm
+                st.rerun()
+
+        try:
+            with st.container(key=_rail_wrap_key):
+                _rail_content()
+        except TypeError:
+            _rail_content()
+    with card_col:
+        _render_snippet_block(
+            _snippet_card_inner_html(row, archetypes=archetypes, stances=stances, visions=visions)
+        )
 
 
 def _inject_branding_css() -> None:
     st.markdown(
         """
 <style>
+  /*
+    Align filter dock, summary/chart/cloud, and snippet nav with the snippet list width
+    (single wide column). Updated by _snippet_grid_responsive_script.
+  */
+  :root {
+    --ave-explore-snippet-max: min(90rem, 100%);
+  }
+  /*
+    Sidebar expand: match slate/teal top-bar strip (.ave-main-strip); three vertical bars replace chevrons.
+  */
+  [data-testid="stExpandSidebarButton"] {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: auto !important;
+    min-width: 2.5rem !important;
+    min-height: 2.25rem !important;
+    padding: 0.32rem 0.5rem !important;
+    border-radius: 8px !important;
+    background: linear-gradient(125deg, rgba(47, 74, 94, 0.92) 0%, rgba(74, 107, 130, 0.88) 55%, rgba(100, 96, 72, 0.82) 100%) !important;
+    border: 1px solid rgba(47, 74, 94, 0.28) !important;
+    color: #f8fafc !important;
+    box-shadow: 0 1px 2px rgba(35, 48, 58, 0.1) !important;
+  }
+  [data-testid="stExpandSidebarButton"]:hover {
+    filter: brightness(1.06);
+    border-color: rgba(47, 74, 94, 0.42) !important;
+  }
+  [data-testid="stExpandSidebarButton"] svg,
+  [data-testid="stExpandSidebarButton"] img {
+    display: none !important;
+  }
+  /* Three short vertical bars (menu affordance), replaces Streamlit chevrons */
+  [data-testid="stExpandSidebarButton"]::after {
+    content: "";
+    display: block;
+    width: 2px;
+    height: 11px;
+    background: currentColor;
+    border-radius: 1px;
+    opacity: 0.92;
+    box-shadow: 4px 0 0 currentColor, 8px 0 0 currentColor;
+  }
+  /* List options → Adjust filters: plain HTML button (client-side only — no Streamlit rerun) */
+  button.ave-popover-open-sidebar {
+    width: 100%;
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0.375rem 0.75rem;
+    border-radius: 0.5rem;
+    border: 1px solid rgb(213, 218, 224);
+    background: rgb(255, 255, 255);
+    color: rgb(49, 51, 63);
+    font-size: 0.875rem;
+    font-weight: 450;
+    font-family: "Source Sans Pro", sans-serif;
+    cursor: pointer;
+    line-height: 1.4;
+  }
+  button.ave-popover-open-sidebar:hover {
+    border-color: rgb(179, 184, 194);
+    color: rgb(49, 51, 63);
+  }
+  button.ave-popover-open-sidebar:focus-visible {
+    outline: 2px solid rgba(47, 74, 94, 0.45);
+    outline-offset: 1px;
+  }
+  /* Main top padding — don’t exaggerate (large gap reads as “empty blue”) */
+  [data-testid="stMain"] .block-container {
+    padding-top: 3.25rem !important;
+  }
+  @media (max-width: 768px) {
+    [data-testid="stMain"] .block-container {
+      padding-top: 3rem !important;
+    }
+  }
   .ave-filter-card {
     background: linear-gradient(180deg, #ffffff 0%, #f7f4ef 100%);
     border: 1px solid #e0d8ce;
@@ -526,12 +963,12 @@ def _inject_branding_css() -> None:
     When .ave-fixed-nav-visible (after scrolling past #ave-snippet-toolbar-sentinel), pin under app header.
     Flexbox (not grid) so Streamlit column cells never collapse to ~0 width.
   */
-  section[data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) {
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) {
     position: relative !important;
     left: auto !important;
     right: auto !important;
     width: 100% !important;
-    max-width: min(100%, 72rem) !important;
+    max-width: var(--ave-explore-snippet-max) !important;
     margin: 0 auto 0.65rem auto !important;
     z-index: 10 !important;
     background: rgba(250, 248, 245, 0.98) !important;
@@ -551,7 +988,7 @@ def _inject_branding_css() -> None:
     pointer-events: auto !important;
     transition: box-shadow 0.2s ease, border-radius 0.2s ease;
   }
-  section[data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar).ave-fixed-nav-visible {
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar).ave-fixed-nav-visible {
     position: fixed !important;
     top: 3.25rem !important;
     left: var(--ave-sidebar-w, 21rem) !important;
@@ -573,64 +1010,173 @@ def _inject_branding_css() -> None:
     min-width: 4.5rem !important;
     max-width: 100% !important;
   }
+  /* Col1 = counts; Col2 = pager; Col3 = popover (Per page + Order by) */
   div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(1) {
-    flex: 1 1 12rem !important;
-    min-width: min(100%, 12rem) !important;
+    flex: 1 1 10rem !important;
+    min-width: min(100%, 9rem) !important;
   }
+  /* Pager cluster (nested row: Prev · page · Next · Top) */
   div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) {
-    flex: 0 1 5.5rem !important;
-    min-width: 4.75rem !important;
-    max-width: 6.5rem !important;
-  }
-  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(3) {
-    flex: 1 1 11rem !important;
-    min-width: min(100%, 10rem) !important;
-    max-width: 26rem !important;
-  }
-  /* Column 4 = pager cluster (nested row: Prev · page · Next · Top — stays together on wrap) */
-  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(4) {
-    flex: 1 1 17rem !important;
-    min-width: min(100%, 14rem) !important;
+    flex: 1 1 12rem !important;
+    min-width: min(100%, 11rem) !important;
     max-width: 100% !important;
   }
-  /* Nested row lives inside column 4 (not always direct child of column — omit > before stHorizontalBlock) */
-  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(4) div[data-testid="stHorizontalBlock"] {
+  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) div[data-testid="stHorizontalBlock"] {
     display: flex !important;
     flex-direction: row !important;
     flex-wrap: nowrap !important;
     align-items: center !important;
-    justify-content: flex-end !important;
-    gap: 0.35rem 0.45rem !important;
+    justify-content: center !important;
+    gap: 0.3rem 0.4rem !important;
     width: 100% !important;
-    min-width: min(100%, 17.5rem) !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
   }
-  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(4) div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+  /* Direct-child column rules use min-width:0 for desktop flex; on phones they collapse sibling columns — scoped below */
+  @media (min-width: 641px) {
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+      flex: 0 1 auto !important;
+      min-width: 0 !important;
+      max-width: none !important;
+    }
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:nth-child(2) {
+      flex: 1 1 5rem !important;
+      min-width: 4rem !important;
+    }
+  }
+  /* List options popover trigger — compact chip in the bar */
+  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(3) {
     flex: 0 0 auto !important;
-    min-width: 3rem !important;
-    max-width: none !important;
-  }
-  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(4) div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:nth-child(2) {
-    flex: 1 1 6.5rem !important;
     min-width: 5.5rem !important;
+    max-width: 100% !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: flex-end !important;
   }
-  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) .stSelectbox label p,
-  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) .stSelectbox label span {
-    color: #64748b !important;
-    font-size: 0.72rem !important;
-    font-weight: 500 !important;
+  /* List options: match pager row height (Prev/Next use min-height:0 + tight padding) */
+  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(3) button {
+    font-size: 0.8rem !important;
+    padding: 0.14rem 0.5rem !important;
+    min-height: 0 !important;
+    height: auto !important;
+    line-height: 1.2 !important;
+    white-space: nowrap !important;
   }
-  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) [data-baseweb="select"] {
-    opacity: 0.95 !important;
-    min-height: 2.1rem !important;
-    font-size: 0.85rem !important;
+  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(3) .stButton > button p {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: inherit !important;
+    font-size: inherit !important;
   }
-  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(3) .stSelectbox label p,
-  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(3) .stSelectbox label span {
+  /* Popover panel: snippet nav is the only popover in this app */
+  [data-testid="stPopover"] .stSelectbox label p,
+  [data-testid="stPopover"] .stSelectbox label span {
     font-size: 0.78rem !important;
     color: #334155 !important;
   }
+  [data-testid="stPopover"] [data-baseweb="select"] {
+    min-height: 1.85rem !important;
+    font-size: 0.85rem !important;
+  }
+  @media (max-width: 640px) {
+    [data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) {
+      padding: 0.45rem max(0.75rem, env(safe-area-inset-right)) 0.5rem max(0.75rem, env(safe-area-inset-left)) !important;
+      gap: 0.55rem !important;
+      align-items: stretch !important;
+      flex-direction: column !important;
+      flex-wrap: nowrap !important;
+      overflow-x: visible !important;
+    }
+    [data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar).ave-fixed-nav-visible {
+      padding-left: max(0.75rem, env(safe-area-inset-left)) !important;
+      padding-right: max(0.75rem, env(safe-area-inset-right)) !important;
+    }
+    /* Undo global 4.5rem floor on the three top-level cells so the column stack doesn’t clip */
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div {
+      min-width: 0 !important;
+    }
+    /* Stack: pager → counts → list options (no overlapping rows) */
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) {
+      order: 1 !important;
+      flex: 0 0 auto !important;
+      width: 100% !important;
+      min-width: 0 !important;
+      max-width: 100% !important;
+    }
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(1) {
+      order: 2 !important;
+      flex: 0 0 auto !important;
+      width: 100% !important;
+      min-width: 0 !important;
+      max-width: 100% !important;
+    }
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(3) {
+      order: 3 !important;
+      flex: 0 0 auto !important;
+      width: 100% !important;
+      min-width: 0 !important;
+      justify-content: stretch !important;
+      margin-top: 0 !important;
+    }
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(3) > div {
+      width: 100% !important;
+    }
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(3) button {
+      width: 100% !important;
+    }
+    .ave-nav-toolbar-stats {
+      padding: 0 !important;
+      margin: 0 !important;
+      max-width: none !important;
+    }
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) div[data-testid="stHorizontalBlock"] {
+      flex-wrap: wrap !important;
+      justify-content: center !important;
+      align-content: center !important;
+      gap: 0.35rem 0.45rem !important;
+    }
+    /*
+      Do not let nested pager columns shrink to 0 width (hides Page / Next / Top).
+      flex-shrink: 0 + wrap so the row reflows instead of clipping.
+    */
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) [data-testid="column"] {
+      flex: 0 0 auto !important;
+      flex-shrink: 0 !important;
+      min-width: auto !important;
+      max-width: 100% !important;
+      overflow: visible !important;
+    }
+    /* Prev/Next: content-sized so one column doesn’t dominate the row */
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) .stButton > button {
+      width: auto !important;
+      min-width: 2.75rem !important;
+    }
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) .stButton {
+      width: auto !important;
+      min-width: 0 !important;
+      flex-shrink: 0 !important;
+    }
+    .ave-nav-toolbar-page {
+      padding-left: 0.15rem !important;
+      padding-right: 0.15rem !important;
+    }
+  }
   div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) .stButton > button {
     white-space: nowrap !important;
+  }
+  /* Pager Prev/Next: override Streamlit default min-height / padding (was visually very tall) */
+  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) .stButton > button {
+    padding: 0.18rem 0.5rem !important;
+    min-height: 0 !important;
+    height: auto !important;
+    font-size: 0.8rem !important;
+    line-height: 1.2 !important;
+  }
+  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) .stButton > button p {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: inherit !important;
+    font-size: inherit !important;
   }
   div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) a {
     white-space: nowrap !important;
@@ -639,7 +1185,7 @@ def _inject_branding_css() -> None:
     display: flex !important;
     align-items: center !important;
     justify-content: center !important;
-    min-height: 2rem !important;
+    min-height: 1.5rem !important;
     padding: 0 !important;
     box-sizing: border-box !important;
   }
@@ -647,7 +1193,7 @@ def _inject_branding_css() -> None:
     color: #2f4a5e !important;
     font-weight: 600 !important;
     text-decoration: none !important;
-    font-size: 0.88rem !important;
+    font-size: 0.8rem !important;
     flex-shrink: 0 !important;
   }
   .ave-nav-toolbar-page {
@@ -661,9 +1207,9 @@ def _inject_branding_css() -> None:
   .ave-nav-toolbar-page strong { color: #1e293b; font-weight: 700; }
   /* Wide: full-bleed fixed bar aligned with main column max width */
   @media (min-width: 900px) {
-    section[data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar).ave-fixed-nav-visible {
-      padding-left: max(1rem, calc((100% - min(100%, 72rem)) / 2)) !important;
-      padding-right: max(1rem, calc((100% - min(100%, 72rem)) / 2)) !important;
+    [data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar).ave-fixed-nav-visible {
+      padding-left: max(1rem, calc((100% - var(--ave-explore-snippet-max)) / 2)) !important;
+      padding-right: max(1rem, calc((100% - var(--ave-explore-snippet-max)) / 2)) !important;
     }
     .ave-nav-toolbar-stats {
       max-width: none !important;
@@ -684,18 +1230,37 @@ def _inject_branding_css() -> None:
     word-break: normal !important;
   }
   .ave-nav-toolbar-stats strong { color: #1e293b; font-weight: 700; }
-  /* Nested Streamlit column widgets: respect parent min-width (ratios alone can go near-zero) */
-  div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) div[data-testid="column"] {
-    flex: 1 1 auto !important;
-    width: 100% !important;
-    min-width: 4.5rem !important;
+  /* Keep unique count numerically tabular but same weight/size as other stats on the line */
+  .ave-nav-toolbar-stats--dedupe .ave-nav-stat-hero {
+    font-size: inherit;
+    font-weight: 700;
+    letter-spacing: normal;
+    font-variant-numeric: tabular-nums;
+    color: #1e293b;
+  }
+  .ave-nav-toolbar-stats--dedupe {
+    max-width: min(36rem, 100%) !important;
+  }
+  /*
+    Pager row (tablet/desktop): nested columns may sit under a VerticalBlock — descendant selector.
+    min-width: 0 only above mobile — on phones a later @media (max-width: 640px) block prevents zero-width columns.
+  */
+  @media (min-width: 641px) {
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) [data-testid="column"] {
+      flex: 0 1 auto !important;
+      min-width: 0 !important;
+      max-width: 100% !important;
+    }
+    div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar) > div:nth-child(2) .stButton > button {
+      max-width: 100% !important;
+    }
   }
   .ave-nav-toolbar-gap {
     width: 100%;
     min-width: 0.5rem;
   }
   @media (max-width: 768px) {
-    section[data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar).ave-fixed-nav-visible {
+    [data-testid="stMain"] div[data-testid="stHorizontalBlock"]:has(span#ave-pin-toolbar).ave-fixed-nav-visible {
       left: 0 !important;
     }
   }
@@ -707,45 +1272,92 @@ def _inject_branding_css() -> None:
     pointer-events: none;
     transition: min-height 0.15s ease;
   }
-  /* Spacer when fixed nav is visible (matches one vs stacked toolbar height) */
+  /* Spacer when fixed nav is visible (toolbar ≈ stats + pager + list-options popover; stacks on narrow viewports) */
   .ave-nav-flow-spacer.ave-nav-spacer-open {
-    height: 7.75rem;
-    min-height: 7.75rem;
+    height: 6.5rem;
+    min-height: 6.5rem;
   }
   @media (min-width: 900px) {
     .ave-nav-flow-spacer.ave-nav-spacer-open {
-      height: 4.35rem;
-      min-height: 4.35rem;
+      height: 4rem;
+      min-height: 4rem;
     }
   }
-  @media (max-width: 899px) {
+  @media (max-width: 640px) {
     .ave-nav-flow-spacer.ave-nav-spacer-open {
-      height: 7.25rem;
-      min-height: 7.25rem;
+      height: 9.75rem;
+      min-height: 9.75rem;
     }
   }
   .ave-jump-chips {
     margin: 0 0 0.75rem 0;
   }
-  /* Stats row: same width as filter chips below (max 72rem); visually merged into one card */
+  /*
+    Filter dock: stats + chips live in `st.container(border=True)` — one small DOM wrapper only.
+    Style that wrapper (not generic stVerticalBlock:has, which matched page-wide ancestors).
+  */
   .ave-chips-dock-stats {
-    max-width: min(100%, 72rem);
-    margin: 0 auto;
+    width: 100%;
+    margin: 0;
     padding: 0;
     box-sizing: border-box;
+  }
+  /* Blue dock: wrapper, JS class, and inner VerticalBlock (direct child of border — avoids :has() misses) */
+  [data-testid="stMain"] div[data-testid="stVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats),
+  [data-testid="stMain"] div[data-testid="stStyledVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats),
+  [data-testid="stMain"] .ave-chips-dock-frame,
+  [data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"] > [data-testid="stVerticalBlock"]:has(.ave-chips-dock-stats),
+  [data-testid="stMain"] [data-testid="stStyledVerticalBlockBorderWrapper"] > [data-testid="stVerticalBlock"]:has(.ave-chips-dock-stats),
+  [data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"] > div > [data-testid="stVerticalBlock"]:has(.ave-chips-dock-stats),
+  [data-testid="stMain"] [data-testid="stStyledVerticalBlockBorderWrapper"] > div > [data-testid="stVerticalBlock"]:has(.ave-chips-dock-stats) {
+    background: linear-gradient(180deg, #c4daf6 0%, #a8c8f0 52%, #8eb6e8 100%) !important;
+    border: 1px solid #5a8ec8 !important;
+    border-radius: 12px !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 1px 2px rgba(30, 58, 95, 0.08) !important;
+    padding: 0.45rem 0.75rem 0.6rem 0.75rem !important;
+    max-width: var(--ave-explore-snippet-max) !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+    margin-top: 0.35rem !important;
+    margin-bottom: 0.65rem !important;
+    box-sizing: border-box !important;
+  }
+  /*
+    Filter chip dock + summary / chart / keyword cloud: same max width as snippet grid (key on st.container).
+    Streamlit attaches st-key-* to the block; match any class substring for version tolerance.
+  */
+  [data-testid="stMain"] [class*="st-key-ave_snippet_width_stack"],
+  [data-testid="stMain"] [class*="st-key-ave_chips_dock_width"],
+  [data-testid="stMain"] [class*="st-key-ave-chips-dock-width"] {
+    max-width: var(--ave-explore-snippet-max) !important;
+    width: 100% !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+    box-sizing: border-box !important;
+  }
+  /* Filter chip rows: equal-width columns inside the dock */
+  [data-testid="stMain"] [class*="st-key-ave_chips_dock_width"] [data-testid="stHorizontalBlock"],
+  [data-testid="stMain"] [class*="st-key-ave-chips-dock-width"] [data-testid="stHorizontalBlock"] {
+    align-items: stretch !important;
+  }
+  [data-testid="stMain"] [class*="st-key-ave_chips_dock_width"] [data-testid="stHorizontalBlock"] > div[data-testid="column"],
+  [data-testid="stMain"] [class*="st-key-ave-chips-dock-width"] [data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+    flex: 1 1 0% !important;
+    min-width: 0 !important;
   }
   .ave-chip-stats-summary {
     font-size: 0.84rem;
     color: #475569;
     margin: 0;
-    padding: 0.55rem 0.85rem 0.6rem 0.85rem;
-    background: linear-gradient(180deg, #eef3f9 0%, #e8eef4 100%);
-    border: 1px solid #b0c4d8;
-    border-bottom: none;
-    border-radius: 12px 12px 0 0;
+    padding: 0 0 0.35rem 0;
+    background: transparent !important;
+    border: none !important;
+    border-radius: 0 !important;
     width: 100%;
     line-height: 1.5;
     box-sizing: border-box;
+    position: relative;
+    z-index: 2;
   }
   .ave-chip-stats-lead {
     margin-right: 0.35rem;
@@ -755,6 +1367,23 @@ def _inject_branding_css() -> None:
   .ave-chip-stats-summary span {
     font-weight: 700;
     color: #0f172a;
+  }
+  .ave-chip-stats-summary--dedupe .ave-chip-stat-hero {
+    font-size: inherit;
+    font-weight: 700;
+    color: #0f172a;
+    letter-spacing: normal;
+    font-variant-numeric: tabular-nums;
+  }
+  .ave-chip-stats-summary--dedupe .ave-chip-stat-hero-label {
+    font-weight: 600;
+    font-size: inherit;
+    color: #475569;
+  }
+  .ave-chip-stats-summary--dedupe .ave-chip-stat-muted {
+    font-weight: 600;
+    font-size: 0.82rem;
+    color: #64748b;
   }
   .ave-chip-stats-summary em {
     font-style: normal;
@@ -806,6 +1435,10 @@ def _inject_branding_css() -> None:
     object-fit: contain;
     display: block;
     border-radius: 7px;
+    transition: transform 0.2s ease;
+  }
+  .ave-sidebar-brand .sb-logo:hover img {
+    transform: scale(1.06);
   }
   .ave-main-strip-inner {
     display: inline-flex;
@@ -820,81 +1453,502 @@ def _inject_branding_css() -> None:
     flex-shrink: 0;
     vertical-align: middle;
   }
+  /* Vision Explorer title bar: icon on a light tile (readable on dark blue gradient) */
+  .ave-strip-brand-wrap {
+    display: inline-flex;
+    width: 2.35rem;
+    height: 2.35rem;
+    min-width: 2.35rem;
+    min-height: 2.35rem;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: center;
+    vertical-align: middle;
+    box-sizing: border-box;
+    padding: 3px;
+    border-radius: 10px;
+    background: linear-gradient(145deg, #ffffff 0%, #f5f0e8 55%, #eef4f9 100%);
+    border: 1px solid rgba(255, 255, 255, 0.95);
+    box-shadow: 0 1px 5px rgba(15, 30, 45, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  }
+  .ave-strip-brand-wrap .ave-brand-mark {
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: default;
+    border-radius: 6px;
+  }
+  /* Ring origins for ecological scale animations (inline SVG + overlay only) */
+  .ave-brand-mark .ave-ring-palisade,
+  #ave-loading-overlay .ave-loading-overlay__svg-host .ave-ring-palisade {
+    transform-origin: 28px 50px;
+  }
+  .ave-brand-mark .ave-ring-mediator,
+  #ave-loading-overlay .ave-loading-overlay__svg-host .ave-ring-mediator {
+    transform-origin: 50px 50px;
+  }
+  .ave-brand-mark .ave-ring-parasite,
+  #ave-loading-overlay .ave-loading-overlay__svg-host .ave-ring-parasite {
+    transform-origin: 72px 50px;
+  }
+  @keyframes ave-group-breathe {
+    0%, 100% { opacity: 0.9; }
+    50% { opacity: 1; }
+  }
+  @keyframes ave-palisade-eco {
+    0%, 100% { transform: scale(1.12); }
+    25% { transform: scale(0.86); }
+    50% { transform: scale(0.82); }
+    75% { transform: scale(0.86); }
+  }
+  @keyframes ave-parasite-eco {
+    0%, 100% { transform: scale(0.82); }
+    25% { transform: scale(0.86); }
+    50% { transform: scale(1.12); }
+    75% { transform: scale(0.86); }
+  }
+  @keyframes ave-mediator-eco {
+    0%, 100% { transform: scale(0.92); }
+    25% { transform: scale(1.14); }
+    50% { transform: scale(0.92); }
+    75% { transform: scale(1.14); }
+  }
+  /* Default: static rings (sidebar img is static in file; inline mark has no motion until hover/loading) */
+  .ave-brand-mark .ave-ring-group,
+  .ave-brand-mark .ave-ring-palisade,
+  .ave-brand-mark .ave-ring-mediator,
+  .ave-brand-mark .ave-ring-parasite {
+    animation: none;
+  }
+  /* Hover: full ecological motion (title bar / any inline .ave-brand-mark) */
+  .ave-brand-mark:hover:not(.ave-brand-mark--busy) .ave-ring-group {
+    animation: ave-group-breathe 2.85s ease-in-out infinite;
+  }
+  .ave-brand-mark:hover:not(.ave-brand-mark--busy) .ave-ring-palisade {
+    animation: ave-palisade-eco 2.85s ease-in-out infinite;
+  }
+  .ave-brand-mark:hover:not(.ave-brand-mark--busy) .ave-ring-mediator {
+    animation: ave-mediator-eco 2.85s ease-in-out infinite;
+  }
+  .ave-brand-mark:hover:not(.ave-brand-mark--busy) .ave-ring-parasite {
+    animation: ave-parasite-eco 2.85s ease-in-out infinite;
+  }
+  /* Rerun / busy: fast motion on header icon (see _expl_title_row_script) */
+  .ave-brand-mark.ave-brand-mark--busy .ave-ring-group {
+    animation: ave-group-breathe 0.36s linear infinite !important;
+  }
+  .ave-brand-mark.ave-brand-mark--busy .ave-ring-palisade {
+    animation: ave-palisade-eco 0.36s linear infinite !important;
+  }
+  .ave-brand-mark.ave-brand-mark--busy .ave-ring-mediator {
+    animation: ave-mediator-eco 0.36s linear infinite !important;
+  }
+  .ave-brand-mark.ave-brand-mark--busy .ave-ring-parasite {
+    animation: ave-parasite-eco 0.36s linear infinite !important;
+  }
+  /*
+    Full-screen loading overlay: injected only into the Streamlit app document (see _loading_overlay_script).
+    pointer-events: none so the glass layer never steals clicks (Safari-safe); visual feedback only.
+  */
+  #ave-loading-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    padding: 1.5rem;
+    margin: 0;
+    border: none;
+    background: rgba(248, 250, 252, 0.78);
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+    pointer-events: none;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.22s ease, visibility 0.22s ease;
+  }
+  #ave-loading-overlay.ave-loading-overlay--visible {
+    opacity: 1;
+    visibility: visible;
+  }
+  #ave-loading-overlay:not(.ave-loading-overlay--visible) .ave-loading-overlay__mark {
+    animation: none !important;
+  }
+  #ave-loading-overlay:not(.ave-loading-overlay--visible) .ave-loading-overlay__mark .ave-ring-group,
+  #ave-loading-overlay:not(.ave-loading-overlay--visible) .ave-loading-overlay__mark .ave-ring-palisade,
+  #ave-loading-overlay:not(.ave-loading-overlay--visible) .ave-loading-overlay__mark .ave-ring-mediator,
+  #ave-loading-overlay:not(.ave-loading-overlay--visible) .ave-loading-overlay__mark .ave-ring-parasite {
+    animation: none !important;
+  }
+  .ave-loading-overlay__inner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.85rem;
+    max-width: 22rem;
+    text-align: center;
+    pointer-events: none;
+  }
+  .ave-loading-overlay__svg-host {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 112px;
+    height: 112px;
+    border-radius: 18px;
+    background: linear-gradient(145deg, #f7f4ef, #e3eef6);
+    border: 1px solid #c5d8e8;
+    box-shadow: 0 6px 28px rgba(35, 48, 58, 0.12);
+    padding: 10px;
+    box-sizing: border-box;
+  }
+  .ave-loading-overlay__svg-host .ave-loading-overlay__mark {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  .ave-loading-overlay__msg {
+    margin: 0;
+    font-family: "Source Sans Pro", sans-serif;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: #2f4a5e;
+    letter-spacing: 0.01em;
+    line-height: 1.35;
+  }
+  .ave-loading-overlay__sub {
+    margin: 0;
+    font-family: "Source Sans Pro", sans-serif;
+    font-size: 0.88rem;
+    font-weight: 450;
+    color: #5c6670;
+    line-height: 1.4;
+  }
   .ave-sidebar-brand .sb-title { font-weight: 800; font-size: 1.02rem; color: #2f4a5e; margin: 0; line-height: 1.2; }
   .ave-sidebar-brand .sb-sub { font-size: 0.72rem; color: #5c6670; margin: 0.15rem 0 0 0; }
+  .ave-sidebar-brand .sb-guide-hint { font-size: 0.68rem; color: #7a8794; margin: 0.45rem 0 0 0; line-height: 1.35; font-weight: 400; max-width: 14rem; }
+  .ave-sidebar-brand .sb-guide-hint-short { display: none; }
+  @media (max-width: 768px) {
+    .ave-sidebar-brand .sb-guide-hint-full { display: none; }
+    .ave-sidebar-brand .sb-guide-hint-short { display: block; max-width: none; }
+  }
+  .ave-sidebar-filters-heading {
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #64748b;
+    margin: 0 0 0.45rem 0;
+    padding: 0;
+  }
+  /* Prominent entry to the filters panel on phones (row tagged by JS) */
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-mobile-filters-strip {
+    display: none !important;
+  }
+  @media (max-width: 768px) {
+    [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-mobile-filters-strip {
+      display: flex !important;
+      flex-direction: row !important;
+      flex-wrap: nowrap !important;
+      align-items: stretch !important;
+      gap: 0.5rem !important;
+      width: 100% !important;
+      max-width: min(100%, 72rem) !important;
+      margin: 0 auto 0.5rem auto !important;
+      padding: 0 !important;
+      box-sizing: border-box !important;
+    }
+    [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-mobile-filters-strip > div {
+      flex: 1 1 0 !important;
+      min-width: 0 !important;
+    }
+    [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-mobile-filters-strip .stButton > button {
+      min-height: 2.85rem !important;
+      font-weight: 650 !important;
+      font-size: 0.95rem !important;
+      border-radius: 10px !important;
+    }
+  }
+  /*
+    Title row: single HTML flex bar (``.ave-expl-title-unified``) — avoids Streamlit column shrink / label wrap.
+  */
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.ave-expl-title-unified) {
+    display: block !important;
+    width: 100% !important;
+    max-width: min(100%, 72rem) !important;
+    margin: 0 auto 0.35rem auto !important;
+    padding: 0 !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+  }
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.ave-expl-title-unified) [data-testid="stElementContainer"],
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.ave-expl-title-unified) [data-testid="element-container"] {
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+  .ave-expl-title-unified {
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    gap: 0.75rem !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+    margin: 0 !important;
+    padding: 0.5rem 0.85rem !important;
+    border-radius: 8px !important;
+    /* Slightly richer than the old bar: clearer blue-teal, less muddy brown */
+    background: linear-gradient(125deg, #2a4f72 0%, #3d6f9a 48%, #4f6d8a 100%) !important;
+    box-shadow: 0 2px 10px rgba(25, 45, 72, 0.18) !important;
+  }
+  .ave-expl-title-unified__left {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+    display: flex !important;
+    align-items: center !important;
+  }
+  .ave-expl-title-unified .ave-main-strip--in-expl-row,
+  .ave-expl-title-unified .ave-main-strip.ave-main-strip--in-expl-row {
+    background: transparent !important;
+    box-shadow: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border-radius: 0 !important;
+  }
+  .ave-expl-title-unified .ave-main-strip-inner strong {
+    line-height: 1.2 !important;
+    vertical-align: middle;
+  }
+  .ave-expl-title-unified__link {
+    flex: 0 0 auto !important;
+    white-space: nowrap !important;
+    text-decoration: none !important;
+    margin: 0 !important;
+    background: rgba(255, 255, 255, 0.18) !important;
+    border: 1px solid rgba(255, 255, 255, 0.58) !important;
+    color: #f8fafc !important;
+    font-family: "Iowan Old Style", Palatino, Georgia, serif !important;
+    font-weight: 600 !important;
+    font-size: 0.92rem !important;
+    border-radius: 999px !important;
+    padding: 0.4rem 1.1rem !important;
+    line-height: 1.25 !important;
+    word-break: normal !important;
+    overflow-wrap: normal !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08) !important;
+  }
+  .ave-expl-title-unified__link:hover {
+    background: rgba(255, 255, 255, 0.28) !important;
+    border-color: rgba(255, 255, 255, 0.92) !important;
+    color: #ffffff !important;
+  }
+  @media (max-width: 560px) {
+    .ave-expl-title-unified {
+      flex-wrap: wrap !important;
+    }
+    .ave-expl-title-unified__link {
+      width: 100% !important;
+      text-align: center !important;
+      box-sizing: border-box !important;
+    }
+  }
+  /*
+    Explanations view: back row — JS adds .ave-guide-back-row; fixed under app chrome (sticky fails in Streamlit scroll).
+    #ave-guide-back-flow-spacer reserves in-flow height so guide body does not sit under the bar.
+  */
+  #ave-guide-back-flow-spacer {
+    width: 100%;
+    min-height: 3.25rem;
+    margin: 0 0 0.5rem 0;
+    pointer-events: none;
+    flex-shrink: 0;
+  }
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-guide-back-row {
+    position: fixed !important;
+    top: 3.25rem !important;
+    left: var(--ave-sidebar-w, 21rem) !important;
+    right: 0 !important;
+    width: auto !important;
+    max-width: none !important;
+    margin: 0 !important;
+    z-index: 100002 !important;
+    align-self: stretch !important;
+    padding: 0.55rem 1rem 0.6rem 1rem !important;
+    box-sizing: border-box !important;
+    background: linear-gradient(180deg, #f8f6f3 0%, #f4f1ec 100%) !important;
+    border: 1px solid #e8e4dc !important;
+    border-radius: 0 !important;
+    border-left: none !important;
+    border-right: none !important;
+    border-top: none !important;
+    box-shadow: 0 2px 12px rgba(45, 42, 38, 0.1) !important;
+  }
+  @media (min-width: 900px) {
+    [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-guide-back-row {
+      padding-left: max(1rem, calc((100% - min(100%, 72rem)) / 2)) !important;
+      padding-right: max(1rem, calc((100% - min(100%, 72rem)) / 2)) !important;
+    }
+  }
+  @media (max-width: 768px) {
+    [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-guide-back-row {
+      left: 0 !important;
+    }
+  }
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-guide-back-row > div[data-testid="column"] {
+    min-width: 0 !important;
+  }
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-guide-back-row .stButton > button {
+    background: #ffffff !important;
+    border: 1px solid #c4b8a8 !important;
+    color: #1e293b !important;
+    font-weight: 600 !important;
+    font-size: 0.92rem !important;
+    border-radius: 999px !important;
+    padding: 0.4rem 1.05rem !important;
+    white-space: nowrap !important;
+    box-shadow: 0 1px 2px rgba(30, 41, 59, 0.06) !important;
+  }
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-guide-back-row .stButton > button:hover {
+    border-color: #94a3b8 !important;
+    background: #fafaf8 !important;
+  }
   /* Prevent primary buttons from collapsing to one vertical character in narrow columns */
-  section[data-testid="stMain"] .stButton > button {
+  [data-testid="stMain"] .stButton > button {
     white-space: normal !important;
     line-height: 1.3 !important;
   }
   /*
-    Filter chips: flat fill (no gradient seam), overlapping borders so the two rows read as one pill.
+    Collapsed sidebar: do **not** set pointer-events: none — it has broken click-through to the
+    main column in some Streamlit / browser builds (widgets look loaded but do not respond).
   */
-  section[data-testid="stSidebar"][aria-expanded="false"] {
-    pointer-events: none !important;
-  }
-  /* Blue chip dock: same max-width as stats row above; bottom half of merged “card” */
-  section[data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel {
+  /* Chip rows inside bordered dock — no second box; wrapper supplies the blue frame */
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel {
     position: relative;
-    z-index: 50;
+    z-index: 1;
     display: flex !important;
     flex-direction: row !important;
-    flex-wrap: wrap !important;
+    flex-wrap: nowrap !important;
     align-items: stretch !important;
-    align-content: flex-start !important;
+    align-content: stretch !important;
     gap: 0.45rem !important;
-    row-gap: 0.5rem !important;
-    max-width: min(100%, 72rem) !important;
-    margin-left: auto !important;
-    margin-right: auto !important;
-    margin-top: 0 !important;
-    margin-bottom: 0.65rem !important;
-    background: #e8eef4 !important;
-    background-image: none !important;
-    border: 1px solid #b0c4d8 !important;
-    border-top: none !important;
-    border-radius: 0 0 12px 12px !important;
-    padding: 0.48rem 0.75rem 0.52rem 0.75rem !important;
-    box-shadow: none !important;
-  }
-  /* Direct children are Streamlit column wrappers (may be element containers) */
-  section[data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel > div {
-    flex: 1 1 9.25rem !important;
-    width: auto !important;
-    min-width: min(100%, 8.75rem) !important;
+    width: 100% !important;
+    min-width: 0 !important;
     max-width: 100% !important;
+    margin: 0 !important;
+    background: transparent !important;
+    border: none !important;
+    padding: 0.15rem 0 !important;
+    box-shadow: none !important;
     box-sizing: border-box !important;
   }
-  section[data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel .stButton > button {
-    min-height: 3.65rem !important;
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel--first {
+    margin: 0 !important;
+    padding-bottom: 0.25rem !important;
+  }
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel--last {
+    margin: 0 !important;
+    padding-top: 0.15rem !important;
+    padding-bottom: 0 !important;
+  }
+  /* Streamlit: stHorizontalBlock > element-container > column > … — flex the outer wrappers */
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel > div {
+    flex: 1 1 0 !important;
+    width: auto !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    align-self: stretch !important;
+  }
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel > div [data-testid="column"] {
+    flex: 1 1 auto !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    min-width: min(100%, 9.25rem) !important;
+    width: 100% !important;
+    min-height: 0 !important;
+  }
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel [data-testid="column"] .stButton {
+    flex: 1 1 auto !important;
+    display: flex !important;
+    width: 100% !important;
+    min-height: 0 !important;
+    align-items: stretch !important;
+  }
+  /* Same box height for every chip — stops ragged tops when one value wraps */
+  /* Exclude Explanations “Explore” widgets (keys st-key-gx_ex_*) — broad :has() rules would otherwise style them like chips */
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button,
+  [data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats) [data-testid="stHorizontalBlock"] [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button,
+  [data-testid="stMain"] [data-testid="stStyledVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats) [data-testid="stHorizontalBlock"] [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button {
+    flex: 0 0 auto !important;
+    height: 4.5rem !important;
+    min-height: 4.5rem !important;
+    max-height: 4.5rem !important;
+    box-sizing: border-box !important;
     align-items: flex-start !important;
     justify-content: flex-start !important;
-    padding: 0.5rem 0.6rem !important;
+    padding: 0.45rem 0.55rem !important;
+    overflow: hidden !important;
     background: linear-gradient(180deg, #ffffff 0%, #f4f7fb 100%) !important;
     border: 1px solid #b9ccde !important;
     border-radius: 10px !important;
     box-shadow: 0 1px 3px rgba(30, 58, 95, 0.07) !important;
   }
-  section[data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel .stButton > button:hover {
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button:hover,
+  [data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats) [data-testid="stHorizontalBlock"] [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button:hover,
+  [data-testid="stMain"] [data-testid="stStyledVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats) [data-testid="stHorizontalBlock"] [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button:hover {
     border-color: #8eb4d4 !important;
     box-shadow: 0 2px 8px rgba(30, 58, 95, 0.1) !important;
   }
-  section[data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel .stButton > button p {
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button p,
+  [data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats) [data-testid="stHorizontalBlock"] [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button p,
+  [data-testid="stMain"] [data-testid="stStyledVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats) [data-testid="stHorizontalBlock"] [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button p {
     white-space: pre-line !important;
     text-align: left !important;
     width: 100% !important;
     margin: 0 !important;
-    line-height: 1.3 !important;
-    font-size: 1.02rem !important;
+    line-height: 1.22 !important;
+    font-size: 1.14rem !important;
     font-weight: 700 !important;
     color: #0f172a !important;
+    overflow: hidden !important;
+    word-break: break-word !important;
   }
-  section[data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel .stButton > button p::first-line {
-    font-size: 0.62rem !important;
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button p::first-line,
+  [data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats) [data-testid="stHorizontalBlock"] [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button p::first-line,
+  [data-testid="stMain"] [data-testid="stStyledVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats) [data-testid="stHorizontalBlock"] [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button p::first-line {
+    font-size: 0.58rem !important;
     font-weight: 700 !important;
-    letter-spacing: 0.09em !important;
+    letter-spacing: 0.1em !important;
     text-transform: uppercase !important;
     color: #64748b !important;
+  }
+  /* Time chip: years read larger than the small “TIME” label */
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel--first > div:nth-child(4) .stButton > button p {
+    font-size: 1.28rem !important;
+    letter-spacing: 0.02em !important;
+  }
+  [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-chips-panel--first > div:nth-child(4) .stButton > button p::first-line {
+    font-size: 0.56rem !important;
+    letter-spacing: 0.1em !important;
+  }
+  [data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats) [data-testid="stHorizontalBlock"]:first-of-type > div:nth-child(4) [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button p,
+  [data-testid="stMain"] [data-testid="stStyledVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats) [data-testid="stHorizontalBlock"]:first-of-type > div:nth-child(4) [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button p {
+    font-size: 1.28rem !important;
+    letter-spacing: 0.02em !important;
+  }
+  [data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats) [data-testid="stHorizontalBlock"]:first-of-type > div:nth-child(4) [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button p::first-line,
+  [data-testid="stMain"] [data-testid="stStyledVerticalBlockBorderWrapper"]:has(.ave-chips-dock-stats) [data-testid="stHorizontalBlock"]:first-of-type > div:nth-child(4) [data-testid="stElementContainer"]:not([class*="st-key-gx_ex_"]) .stButton > button p::first-line {
+    font-size: 0.56rem !important;
+    letter-spacing: 0.1em !important;
   }
   /* Sidebar: scroll target flash (main chips / Filter button) */
   section[data-testid="stSidebar"] details.ave-sidebar-section-flash,
@@ -974,36 +2028,332 @@ def _inject_branding_css() -> None:
     margin: 0;
     line-height: 1.55;
   }
-  /* Snippet grid: default 1 col; .ave-snippet-grid--two toggled by JS from main width + sidebar */
-  .ave-snippet-grid {
+  /*
+    Snippet grid: use container width (st.html iframe), not viewport — @media 1024px never fired
+    inside a narrow iframe on MacBook with sidebar open. auto-fill + minmax gives 2 cols when the
+    main block is wide enough.
+  */
+  .ave-snippet-grid.ave-snippet-grid-root {
     display: grid;
-    grid-template-columns: 1fr;
-    gap: 1.35rem 1.5rem;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 22rem), 1fr));
+    gap: 1.85rem 2rem;
     width: 100%;
-    max-width: 52rem;
+    max-width: min(90rem, 100%);
     margin: 0 auto;
+    box-sizing: border-box;
   }
-  .ave-snippet-grid.ave-snippet-grid--two {
-    grid-template-columns: 1fr 1fr;
-    max-width: min(58rem, 100%);
+  /* Dedupe mode: explicit row gap between 2-up pairs (Streamlit ignores many margin hacks) */
+  .ave-snippet-dedupe-pair-spacer {
+    height: 2.5rem;
+    min-height: 2.5rem;
+    margin: 0;
+    padding: 0;
+    pointer-events: none;
+  }
+  /*
+    2-up dedupe layout: outer HorizontalBlock (pair of snippets) — breathing room between rows.
+    Selector: first column’s VerticalBlock directly wraps an inner HorizontalBlock (snippet [1,14]).
+  */
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(
+    > div[data-testid="column"]:first-child > [data-testid="stVerticalBlock"] > [data-testid="stHorizontalBlock"]
+  ) {
+    margin-bottom: 1.85rem !important;
+  }
+  /*
+    Snippet cards use Streamlit columns; default stretch makes the short column as tall as the tall one,
+    so the next row “jumps” unevenly. Align pair rows and inner index|card rows to the top.
+  */
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.ave-snippet-card-wrap) {
+    align-items: flex-start !important;
+  }
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.ave-snippet-card-wrap) > div[data-testid="column"] {
+    align-self: flex-start !important;
+  }
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.ave-snippet-num-col) {
+    align-items: flex-start !important;
+  }
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.ave-snippet-num-col) > div[data-testid="column"] {
+    align-self: flex-start !important;
+  }
+  /*
+    Dedupe index rail: large index (plain) + tiny pill on ×N only; column stays narrow.
+  */
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child:has(> [data-testid="stVerticalBlock"]:has(.ave-snippet-index-rail):not(:has(> [data-testid="stHorizontalBlock"]))) {
+    flex: 0 0 3.15rem !important;
+    width: 3.15rem !important;
+    max-width: 3.15rem !important;
+    min-width: 2.55rem !important;
+    padding-right: 0.55rem !important;
+    box-sizing: border-box !important;
+    padding-top: 0.12rem !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: flex-end !important;
+    gap: 0.2rem !important;
+  }
+  /* Inner VerticalBlock: stack index + ×N only — no outer box */
+  [data-testid="stMain"] [data-testid="stVerticalBlock"]:has(.ave-snippet-index-rail):not(:has(> [data-testid="stHorizontalBlock"])) {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: flex-end !important;
+    gap: 0.12rem !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+  }
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child:has(> [data-testid="stVerticalBlock"]:has(.ave-snippet-index-rail):not(:has(> [data-testid="stHorizontalBlock"]))) [data-testid="stMarkdownContainer"],
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child:has(> [data-testid="stVerticalBlock"]:has(.ave-snippet-index-rail):not(:has(> [data-testid="stHorizontalBlock"]))) [data-testid="stMarkdownContainer"] p {
+    margin-bottom: 0 !important;
+  }
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child:has(> [data-testid="stVerticalBlock"]:has(.ave-snippet-index-rail):not(:has(> [data-testid="stHorizontalBlock"]))) .stButton {
+    width: auto !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+  /* ×N only: small pill; lighter neutral ink than the big index */
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child:has(> [data-testid="stVerticalBlock"]:has(.ave-snippet-index-rail):not(:has(> [data-testid="stHorizontalBlock"]))) .stButton > button {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif !important;
+    font-size: 0.62rem !important;
+    font-weight: 400 !important;
+    color: rgba(198, 192, 184, 0.78) !important;
+    background: rgba(255, 255, 255, 0.96) !important;
+    background-color: rgba(255, 255, 255, 0.96) !important;
+    border: 1px solid rgba(236, 230, 222, 0.88) !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05) !important;
+    border-radius: 999px !important;
+    padding: 0.08rem 0.38rem !important;
+    line-height: 1.15 !important;
+    letter-spacing: 0.02em !important;
+    min-height: 0 !important;
+    height: auto !important;
+    max-height: none !important;
+    width: auto !important;
+    min-width: 0 !important;
+    display: inline-flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 0 !important;
+    -webkit-appearance: none !important;
+    appearance: none !important;
+    opacity: 1 !important;
+  }
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child:has(> [data-testid="stVerticalBlock"]:has(.ave-snippet-index-rail):not(:has(> [data-testid="stHorizontalBlock"]))) .stButton > button p {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.1 !important;
+    white-space: nowrap !important;
+    font-size: inherit !important;
+    font-weight: inherit !important;
+    color: inherit !important;
+    display: inline !important;
+  }
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child:has(> [data-testid="stVerticalBlock"]:has(.ave-snippet-index-rail):not(:has(> [data-testid="stHorizontalBlock"]))) .stButton button[data-testid^="stBaseButton"] {
+    min-height: unset !important;
+  }
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child:has(> [data-testid="stVerticalBlock"]:has(.ave-snippet-index-rail):not(:has(> [data-testid="stHorizontalBlock"]))) .stButton > button:hover {
+    filter: none !important;
+    border-color: rgba(220, 214, 206, 0.98) !important;
+    color: rgba(175, 169, 162, 0.88) !important;
+    background: rgba(255, 255, 255, 1) !important;
+    background-color: rgba(255, 255, 255, 1) !important;
+  }
+  [data-testid="stMain"] [data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child:has(> [data-testid="stVerticalBlock"]:has(.ave-snippet-index-rail):not(:has(> [data-testid="stHorizontalBlock"]))) .stButton > button:focus-visible {
+    outline: 2px solid #4a6b82;
+    outline-offset: 2px;
+  }
+  [data-testid="stMain"] [data-testid="stElementContainer"][class*="st-key-ave_reprint_badge"] .stButton > button,
+  [data-testid="stMain"] [class*="st-key-ave_reprint_badge"] .stButton > button {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif !important;
+    font-size: 0.62rem !important;
+    font-weight: 400 !important;
+    color: rgba(198, 192, 184, 0.78) !important;
+    background: rgba(255, 255, 255, 0.96) !important;
+    background-color: rgba(255, 255, 255, 0.96) !important;
+    border: 1px solid rgba(236, 230, 222, 0.88) !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05) !important;
+    border-radius: 999px !important;
+    padding: 0.08rem 0.38rem !important;
+    line-height: 1.15 !important;
+    letter-spacing: 0.02em !important;
+    min-height: 0 !important;
+    height: auto !important;
+    width: auto !important;
+    display: inline-flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: center !important;
+    -webkit-appearance: none !important;
+    appearance: none !important;
+  }
+  [data-testid="stMain"] [data-testid="stElementContainer"][class*="st-key-ave_reprint_badge"] .stButton > button p,
+  [data-testid="stMain"] [class*="st-key-ave_reprint_badge"] .stButton > button p {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.1 !important;
+    white-space: nowrap !important;
+    font-size: inherit !important;
+    font-weight: inherit !important;
+    color: inherit !important;
+    display: inline !important;
+  }
+  [data-testid="stMain"] [data-testid="stElementContainer"][class*="st-key-ave_reprint_badge"] .stButton > button:hover,
+  [data-testid="stMain"] [class*="st-key-ave_reprint_badge"] .stButton > button:hover {
+    filter: none !important;
+    border-color: rgba(220, 214, 206, 0.98) !important;
+    color: rgba(175, 169, 162, 0.88) !important;
+    background: rgba(255, 255, 255, 1) !important;
+    background-color: rgba(255, 255, 255, 1) !important;
+  }
+  /*
+    Index rail wrap: st.container(key="idxrail_*") — theme-safe ×N pill (Streamlit often wraps Column>VBlock so :> chains miss).
+  */
+  [data-testid="stMain"] [data-testid="stElementContainer"][class*="st-key-idxrail_"] .stButton > button,
+  [data-testid="stMain"] [class*="st-key-idxrail_"] .stButton > button {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif !important;
+    font-size: 0.62rem !important;
+    font-weight: 400 !important;
+    color: rgba(198, 192, 184, 0.78) !important;
+    background: rgba(255, 255, 255, 0.97) !important;
+    background-color: rgba(255, 255, 255, 0.97) !important;
+    border: 1px solid rgba(236, 230, 222, 0.9) !important;
+    border-radius: 999px !important;
+    padding: 0.1rem 0.42rem !important;
+    line-height: 1.15 !important;
+    letter-spacing: 0.02em !important;
+    min-height: 0 !important;
+    height: auto !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06) !important;
+    width: auto !important;
+    display: inline-flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: center !important;
+    -webkit-appearance: none !important;
+    appearance: none !important;
+  }
+  [data-testid="stMain"] [class*="st-key-idxrail_"] .stButton > button p,
+  [data-testid="stMain"] [class*="st-key-idxrail_"] .stButton > button span {
+    color: rgba(198, 192, 184, 0.78) !important;
+    -webkit-text-fill-color: rgba(198, 192, 184, 0.78) !important;
+  }
+  [data-testid="stMain"] [class*="st-key-idxrail_"] .stButton > button * {
+    color: rgba(198, 192, 184, 0.78) !important;
+    -webkit-text-fill-color: rgba(198, 192, 184, 0.78) !important;
+  }
+  [data-testid="stMain"] [class*="st-key-idxrail_"] .stButton > button:hover {
+    filter: none !important;
+    border-color: rgba(220, 214, 206, 0.98) !important;
+    color: rgba(175, 169, 162, 0.88) !important;
+    background: rgba(255, 255, 255, 1) !important;
+    background-color: rgba(255, 255, 255, 1) !important;
+  }
+  [data-testid="stMain"] [class*="st-key-idxrail_"] .stButton > button:hover *,
+  [data-testid="stMain"] [class*="st-key-idxrail_"] .stButton > button:hover p,
+  [data-testid="stMain"] [class*="st-key-idxrail_"] .stButton > button:hover span {
+    color: rgba(175, 169, 162, 0.88) !important;
+    -webkit-text-fill-color: rgba(175, 169, 162, 0.88) !important;
+  }
+  /* Fallback: markdown rail + button are siblings (Streamlit uses stElementContainer or element-container) */
+  [data-testid="stMain"] [data-testid="stMarkdownContainer"]:has(.ave-snippet-index-rail) ~ [data-testid="stElementContainer"] .stButton > button,
+  [data-testid="stMain"] [data-testid="stMarkdownContainer"]:has(.ave-snippet-index-rail) ~ [data-testid="element-container"] .stButton > button {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif !important;
+    font-size: 0.62rem !important;
+    font-weight: 400 !important;
+    color: rgba(198, 192, 184, 0.78) !important;
+    background: rgba(255, 255, 255, 0.97) !important;
+    background-color: rgba(255, 255, 255, 0.97) !important;
+    border: 1px solid rgba(236, 230, 222, 0.9) !important;
+    border-radius: 999px !important;
+    padding: 0.1rem 0.42rem !important;
+    min-height: 0 !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06) !important;
+    -webkit-appearance: none !important;
+    appearance: none !important;
+  }
+  [data-testid="stMain"] [data-testid="stMarkdownContainer"]:has(.ave-snippet-index-rail) ~ [data-testid="stElementContainer"] .stButton > button p,
+  [data-testid="stMain"] [data-testid="stMarkdownContainer"]:has(.ave-snippet-index-rail) ~ [data-testid="element-container"] .stButton > button p {
+    color: rgba(198, 192, 184, 0.78) !important;
+    -webkit-text-fill-color: rgba(198, 192, 184, 0.78) !important;
+  }
+  [data-testid="stMain"] [data-testid="stMarkdownContainer"]:has(.ave-snippet-index-rail) ~ [data-testid="stElementContainer"] .stButton > button *,
+  [data-testid="stMain"] [data-testid="stMarkdownContainer"]:has(.ave-snippet-index-rail) ~ [data-testid="element-container"] .stButton > button * {
+    color: rgba(198, 192, 184, 0.78) !important;
+    -webkit-text-fill-color: rgba(198, 192, 184, 0.78) !important;
+  }
+  [data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stVerticalBlock"]:has(.ave-snippet-index-rail):not(:has(> [data-testid="stHorizontalBlock"])) {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: flex-end !important;
+    gap: 0.12rem !important;
+    width: 100% !important;
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+  }
+  .ave-snippet-num-col--streamlit {
+    width: 100%;
+    align-items: flex-end;
+    margin: 0 !important;
+    padding-bottom: 0 !important;
+    line-height: 1 !important;
   }
   .ave-snippet-item {
     display: grid;
     grid-template-columns: minmax(2.75rem, auto) minmax(0, 1fr);
-    column-gap: 0.65rem;
+    column-gap: 0.95rem;
     align-items: start;
     min-width: 0;
   }
   .ave-snippet-num-col {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.28rem;
     text-align: right;
     padding-top: 0.15rem;
     line-height: 1;
   }
+  .ave-snippet-reprint-badge {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 0.62rem;
+    font-weight: 400;
+    color: rgba(198, 192, 184, 0.78);
+    background: rgba(255, 255, 255, 0.96);
+    border: 1px solid rgba(236, 230, 222, 0.85);
+    border-radius: 999px;
+    padding: 0.08rem 0.38rem;
+    line-height: 1.15;
+    letter-spacing: 0.02em;
+    user-select: none;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  }
+  a.ave-snippet-reprint-badge--link {
+    text-decoration: none;
+    color: inherit;
+    cursor: pointer;
+    display: inline-block;
+    transition: filter 0.12s ease, border-color 0.12s ease;
+  }
+  a.ave-snippet-reprint-badge--link:hover {
+    filter: brightness(0.97);
+    border-color: #d4c8bc;
+  }
+  a.ave-snippet-reprint-badge--link:focus-visible {
+    outline: 2px solid #4a6b82;
+    outline-offset: 2px;
+  }
+  /* Big index = primary rail anchor (darker than ×N multiplicity). */
   .ave-snippet-num {
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
     font-size: clamp(1.65rem, 2.8vw, 2.35rem);
     font-weight: 500;
-    color: rgba(92, 72, 54, 0.28);
+    color: rgba(88, 74, 64, 0.5);
     letter-spacing: -0.04em;
     font-variant-numeric: tabular-nums;
     user-select: none;
@@ -1022,6 +2372,37 @@ def _inject_branding_css() -> None:
     padding: 0.95rem 1.1rem 1.05rem 1.1rem;
     margin: 0;
     box-shadow: 0 1px 8px rgba(45, 42, 38, 0.05);
+  }
+  /* Stacked “sheets” — visible steps but lighter so the rail + ×N don’t sit on near-black slabs */
+  .ave-snippet-card.ave-snippet-card--stack2 {
+    box-shadow:
+      0 1px 8px rgba(45, 42, 38, 0.06),
+      6px 6px 0 #e4e0da,
+      13px 13px 0 #d0cbc4;
+  }
+  .ave-snippet-card.ave-snippet-card--stack3 {
+    box-shadow:
+      0 1px 8px rgba(45, 42, 38, 0.06),
+      6px 6px 0 #e4e0da,
+      13px 13px 0 #d0cbc4,
+      20px 20px 0 #bcb6af;
+  }
+  .ave-snippet-card.ave-snippet-card--stack4 {
+    box-shadow:
+      0 1px 8px rgba(45, 42, 38, 0.06),
+      6px 6px 0 #e4e0da,
+      13px 13px 0 #d0cbc4,
+      20px 20px 0 #bcb6af,
+      27px 27px 0 #a8a29a;
+  }
+  .ave-snippet-card.ave-snippet-card--stack5 {
+    box-shadow:
+      0 1px 8px rgba(45, 42, 38, 0.06),
+      6px 6px 0 #e4e0da,
+      13px 13px 0 #d0cbc4,
+      20px 20px 0 #bcb6af,
+      27px 27px 0 #a8a29a,
+      34px 34px 0 #949088;
   }
   .ave-snippet-title {
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -1046,6 +2427,9 @@ def _inject_branding_css() -> None:
     color: #3f3c38;
     margin: 0;
     white-space: pre-wrap;
+    hyphens: none;
+    overflow-wrap: break-word;
+    word-break: normal;
   }
 </style>
         """,
@@ -1055,16 +2439,16 @@ def _inject_branding_css() -> None:
 
 def _fixed_nav_scroll_script() -> None:
     """Pin snippet toolbar under app header only after #ave-snippet-toolbar-sentinel scrolls up (main iframe DOM)."""
-    components.html(
+    _html_main_script(
         """
 <script>
 (function () {
   function appDocument() {
     try {
-      return window.parent.document;
-    } catch (e) {
-      return document;
-    }
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
   }
   function findToolbar() {
     const doc = appDocument();
@@ -1097,18 +2481,21 @@ def _fixed_nav_scroll_script() -> None:
 })();
 </script>
         """,
-        height=0,
     )
 
 
 def _smooth_scroll_top_script() -> None:
     """Smooth-scroll to #ave-top when clicking the fixed snippet bar ↑ Top link (avoids instant hash jump)."""
-    components.html(
+    _html_main_script(
         """
 <script>
 (function () {
   function appDocument() {
-    try { return window.parent.document; } catch (e) { return document; }
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
   }
   function findTop() {
     const doc = appDocument();
@@ -1136,18 +2523,21 @@ def _smooth_scroll_top_script() -> None:
 })();
 </script>
         """,
-        height=0,
     )
 
 
 def _sidebar_dock_script() -> None:
     """Pin the sidebar row that contains the Filter / Reset all buttons; sync width with resizable sidebar."""
-    components.html(
+    _html_main_script(
         """
 <script>
 (function () {
   function appDocument() {
-    try { return window.parent.document; } catch (e) { return document; }
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
   }
   function syncSidebarVars() {
     const doc = appDocument();
@@ -1169,7 +2559,7 @@ def _sidebar_dock_script() -> None:
       let hasFilter = false, hasReset = false;
       for (const b of btns) {
         const t = (b.innerText || "").trim();
-        if (t === "Filter") hasFilter = true;
+        if (t.includes("Apply filters") || t === "Filter") hasFilter = true;
         if (t === "Reset all") hasReset = true;
       }
       if (hasFilter && hasReset) {
@@ -1184,22 +2574,27 @@ def _sidebar_dock_script() -> None:
   window.parent.addEventListener("resize", syncSidebarVars);
   doc.addEventListener("click", function () { setTimeout(syncSidebarVars, 50); }, true);
   const obs = new MutationObserver(function () { dock(); });
-  obs.observe(doc.body, { childList: true, subtree: true });
+  if (doc.body) {
+    obs.observe(doc.body, { childList: true, subtree: true });
+  }
 })();
 </script>
         """,
-        height=0,
     )
 
 
 def _v2a_multiselect_mute_script() -> None:
     """Lower opacity for ○ (off-manifold) labels in sidebar multiselects — options and tags."""
-    components.html(
+    _html_main_script(
         """
 <script>
 (function () {
   function appDocument() {
-    try { return window.parent.document; } catch (e) { return document; }
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
   }
   function styleEl(el) {
     const t = (el.textContent || "").trim();
@@ -1229,189 +2624,987 @@ def _v2a_multiselect_mute_script() -> None:
   setInterval(apply, 600);
   const doc = appDocument();
   const obs = new MutationObserver(apply);
-  obs.observe(doc.body, { childList: true, subtree: true, attributes: true });
+  if (doc.body) {
+    obs.observe(doc.body, { childList: true, subtree: true, attributes: true });
+  }
 })();
 </script>
         """,
-        height=0,
     )
 
 
-def _chip_bar_panel_script() -> None:
-    """Tag first main horizontal block (filters + sort) as the blue chip panel."""
-    components.html(
+def _guide_back_row_script() -> None:
+    """Tag the back row, sync sidebar width for fixed layout, match spacer height to the bar (same idea as snippet toolbar)."""
+    _html_main_script(
+        r"""
+<script>
+(function () {
+  function appDocument() {
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
+  }
+  function syncSidebarVars() {
+    const doc = appDocument();
+    const root = doc.documentElement;
+    const sb = doc.querySelector('[data-testid="stSidebar"]');
+    if (!root) return;
+    if (!sb) {
+      root.style.setProperty("--ave-sidebar-w", "0px");
+      return;
+    }
+    const r = sb.getBoundingClientRect();
+    root.style.setProperty("--ave-sidebar-left", r.left + "px");
+    root.style.setProperty("--ave-sidebar-w", r.width + "px");
+  }
+  function mark() {
+    syncSidebarVars();
+    const doc = appDocument();
+    const main = doc.querySelector('[data-testid="stMain"]');
+    if (!main) return;
+    for (const b of main.querySelectorAll("button")) {
+      const t = (b.textContent || "").replace(/\s+/g, " ").trim();
+      if (!t.includes("Back to dashboard")) continue;
+      const hb = b.closest('[data-testid="stHorizontalBlock"]');
+      if (hb) hb.classList.add("ave-guide-back-row");
+      break;
+    }
+    syncGuideSpacer();
+  }
+  function syncGuideSpacer() {
+    const doc = appDocument();
+    const bar = doc.querySelector(".ave-guide-back-row");
+    const sp = doc.getElementById("ave-guide-back-flow-spacer");
+    if (!bar || !sp) return;
+    const h = Math.ceil(bar.getBoundingClientRect().height);
+    if (h > 0) {
+      sp.style.height = h + "px";
+      sp.style.minHeight = h + "px";
+    }
+  }
+  mark();
+  setInterval(function () { mark(); }, 320);
+  const doc = appDocument();
+  if (doc.body) {
+    new MutationObserver(mark).observe(doc.body, { childList: true, subtree: true });
+  }
+  window.parent.addEventListener("resize", function () { mark(); });
+  doc.addEventListener("resize", function () { mark(); }, true);
+})();
+</script>
+        """,
+    )
+
+
+def _filter_flash_script(flash: str | None) -> None:
+    """After Explore-from-guide: briefly pulse the matching filter chip and sidebar control."""
+    if not flash:
+        return
+
+    fj = json.dumps(flash)
+    _html_main_script(
+        """
+<script>
+(function () {
+  const FLASH = """
+        + fj
+        + """;
+  function appDocument() {
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
+  }
+  function injectCss() {
+    const doc = appDocument();
+    if (doc.getElementById("ave-filter-flash-style")) return;
+    const s = doc.createElement("style");
+    s.id = "ave-filter-flash-style";
+    s.textContent = `
+@keyframes ave-filter-chip-pulse {
+  0%, 100% { box-shadow: inset 0 0 0 0 rgba(37,99,235,0), 0 0 0 0 rgba(37,99,235,0); }
+  35% { box-shadow: inset 0 0 0 2px rgba(37,99,235,0.55), 0 0 18px rgba(37,99,235,0.35); }
+  65% { box-shadow: inset 0 0 0 1px rgba(37,99,235,0.3), 0 0 10px rgba(37,99,235,0.22); }
+}
+@keyframes ave-filter-sidebar-pulse {
+  0%, 100% { background-color: transparent; }
+  30% { background-color: rgba(59, 130, 246, 0.2); }
+  100% { background-color: transparent; }
+}
+.ave-filter-flash-chip {
+  animation: ave-filter-chip-pulse 0.75s ease-in-out 3 !important;
+  border-radius: 10px !important;
+}
+.ave-filter-flash-sidebar {
+  animation: ave-filter-sidebar-pulse 1.05s ease-out 2 !important;
+  border-radius: 10px !important;
+}
+`;
+    doc.head.appendChild(s);
+  }
+  /* Same idea as _chip_bar_panel_script — do not rely on .ave-chips-panel--first (that class is applied later). */
+  function findPrimaryChipRow(doc) {
+    const main = doc.querySelector('[data-testid="stMain"]');
+    if (!main) return null;
+    const blocks = main.querySelectorAll('[data-testid="stHorizontalBlock"]');
+    for (const hb of blocks) {
+      if (hb.querySelector("#ave-pin-toolbar")) continue;
+      const cols = hb.querySelectorAll('[data-testid="column"]');
+      if (cols.length < 4) continue;
+      const b0 = cols[0].querySelector("button");
+      if (!b0) continue;
+      const t0 = (b0.textContent || "").replace(/\\s+/g, " ").trim();
+      const b3 = cols[3].querySelector("button");
+      const t3 = b3 ? (b3.textContent || "").replace(/\\s+/g, " ").trim() : "";
+      if (/\\bARCHETYPE\\b/i.test(t0) && /\\bTIME\\b/i.test(t3)) return hb;
+    }
+    return null;
+  }
+  let chipDone = false;
+  let sidebarDone = false;
+  function pulseOnce() {
+    injectCss();
+    const doc = appDocument();
+    const colIdx = { archetype: 0, vision: 1, stance: 2 };
+    const idx = colIdx[FLASH];
+    if (idx === undefined) return;
+    const row = findPrimaryChipRow(doc);
+    if (row && !chipDone) {
+      const cols = row.querySelectorAll('[data-testid="column"]');
+      const col = cols[idx];
+      const btn = col && col.querySelector("button");
+      if (btn) {
+        chipDone = true;
+        btn.classList.add("ave-filter-flash-chip");
+        setTimeout(function () { btn.classList.remove("ave-filter-flash-chip"); }, 3200);
+      }
+    }
+    const sb = doc.querySelector('[data-testid="stSidebar"]');
+    if (sb && !sidebarDone) {
+      const needles = { archetype: "Archetype", vision: "Vision type", stance: "Rhetorical stance" };
+      const needle = needles[FLASH];
+      if (needle) {
+        const nodes = sb.querySelectorAll("label, p, span");
+        for (const el of nodes) {
+          const raw = (el.textContent || "").trim();
+          const first = raw.split("\n")[0].trim();
+          if (first !== needle) continue;
+          let w = el.closest('[data-testid="stWidget"]');
+          if (!w) w = el.closest("div[data-baseweb]");
+          if (!w) w = el.parentElement;
+          if (w) {
+            sidebarDone = true;
+            w.classList.add("ave-filter-flash-sidebar");
+            setTimeout(function () { w.classList.remove("ave-filter-flash-sidebar"); }, 2600);
+          }
+          break;
+        }
+      }
+    }
+  }
+  const delays = [0, 120, 350, 700, 1200, 2000, 3200, 5000];
+  for (let i = 0; i < delays.length; i++) {
+    setTimeout(pulseOnce, delays[i]);
+  }
+})();
+</script>
+        """,
+    )
+
+
+def _expl_title_row_script() -> None:
+    """Mark the title + Explanations row so CSS can style the two columns as one gradient bar."""
+    _html_main_script(
         """
 <script>
 (function () {
   function appDocument() {
-    try { return window.parent.document; } catch (e) { return document; }
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
+  }
+  function mark() {
+    const doc = appDocument();
+    const main = doc.querySelector('[data-testid="stMain"]');
+    if (!main) return;
+    const uni = main.querySelector(".ave-expl-title-unified");
+    if (!uni) return;
+    const hb = uni.closest('[data-testid="stHorizontalBlock"]');
+    if (hb) hb.classList.add("ave-expl-title-row");
+  }
+  mark();
+  setInterval(mark, 1200);
+  const doc = appDocument();
+  if (doc.body) {
+    new MutationObserver(mark).observe(doc.body, { childList: true, subtree: true });
+  }
+})();
+</script>
+        """,
+    )
+
+
+def _loading_overlay_script() -> None:
+    """Centered glass + pulsating three-ring SVG while Streamlit reruns (cold load and filter changes)."""
+    svg_inner = ""
+    if os.path.isfile(_BRAND_SVG_PATH):
+        with open(_BRAND_SVG_PATH, encoding="utf-8") as f:
+            _raw = f.read().strip()
+        svg_inner = _raw.replace(
+            "<svg",
+            '<svg class="ave-brand-mark ave-brand-mark--busy ave-loading-overlay__mark" aria-hidden="true"',
+            1,
+        )
+    _svg_json = json.dumps(svg_inner)
+    _html_main_script(
+        """
+<script>
+(function () {
+  const SVG_INNER = """
+        + _svg_json
+        + r""";
+  if (window.__aveLoadingOverlayInit) {
+    return;
+  }
+  window.__aveLoadingOverlayInit = true;
+  function appDocument() {
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
+  }
+  function ensureOverlay(doc) {
+    var el = doc.getElementById("ave-loading-overlay");
+    if (el) return el;
+    el = doc.createElement("div");
+    el.id = "ave-loading-overlay";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    el.setAttribute("aria-busy", "true");
+    var inner = doc.createElement("div");
+    inner.className = "ave-loading-overlay__inner";
+    var host = doc.createElement("div");
+    host.className = "ave-loading-overlay__svg-host";
+    if (SVG_INNER) {
+      host.innerHTML = SVG_INNER;
+    } else {
+      host.textContent = "…";
+    }
+    var msg = doc.createElement("p");
+    msg.className = "ave-loading-overlay__msg";
+    msg.textContent = "Working…";
+    var sub = doc.createElement("p");
+    sub.className = "ave-loading-overlay__sub";
+    sub.textContent = "Updating the dashboard";
+    inner.appendChild(host);
+    inner.appendChild(msg);
+    inner.appendChild(sub);
+    el.appendChild(inner);
+    doc.body.appendChild(el);
+    return el;
+  }
+  function isStreamlitRunning(doc) {
+    var st = doc.querySelector('[data-testid="stStatusWidget"]');
+    if (st) {
+      var t = (st.textContent || "").toLowerCase();
+      if (t.indexOf("running") >= 0) return true;
+    }
+    if (doc.querySelector('[data-testid="stHeader"] [data-testid="stSpinner"]')) return true;
+    return false;
+  }
+  function dashboardReady(doc) {
+    return !!doc.querySelector('[data-testid="stMain"] .ave-expl-title-unified');
+  }
+  var visible = false;
+  var pollTimer = null;
+  function setVisible(doc, on) {
+    var el = ensureOverlay(doc);
+    if (on === visible) return;
+    visible = on;
+    if (on) el.classList.add("ave-loading-overlay--visible");
+    else el.classList.remove("ave-loading-overlay--visible");
+    el.setAttribute("aria-busy", on ? "true" : "false");
+  }
+  function clearPoll() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+  /** Wait until Streamlit status is idle for a few ticks (avoids flicker before "Running" appears). */
+  function waitIdleThenHide() {
+    clearPoll();
+    var steady = 0;
+    pollTimer = setInterval(function () {
+      var d = appDocument();
+      if (isStreamlitRunning(d)) {
+        steady = 0;
+        return;
+      }
+      steady++;
+      if (steady < 3) return;
+      setVisible(d, false);
+      clearPoll();
+    }, 48);
+  }
+  function boot() {
+    var doc = appDocument();
+    ensureOverlay(doc);
+    setVisible(doc, true);
+    var ticks = 0;
+    var steady = 0;
+    var iv = setInterval(function () {
+      ticks++;
+      var d = appDocument();
+      if (dashboardReady(d) && !isStreamlitRunning(d)) {
+        steady++;
+      } else {
+        steady = 0;
+      }
+      if (steady >= 4) {
+        setVisible(d, false);
+        clearInterval(iv);
+        return;
+      }
+      if (ticks > 900) {
+        setVisible(d, false);
+        clearInterval(iv);
+      }
+    }, 48);
+  }
+  function onRerunExpected() {
+    var doc = appDocument();
+    setVisible(doc, true);
+    waitIdleThenHide();
+  }
+  function isWidgetInteraction(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var tag = (el.tagName || "").toLowerCase();
+    if (tag === "button" || tag === "input" || tag === "textarea" || tag === "select") return true;
+    var role = el.getAttribute && el.getAttribute("role");
+    if (role === "option" || role === "listbox" || role === "combobox" || role === "menuitem" || role === "switch" || role === "menuitemcheckbox") return true;
+    if (el.closest && el.closest("[data-baseweb]")) return true;
+    if (el.closest && el.closest(".stSlider")) return true;
+    return false;
+  }
+  function onPointerDown(ev) {
+    var t = ev.target;
+    if (!t || !t.closest) return;
+    if (!t.closest('[data-testid="stAppViewContainer"]') && !t.closest('[data-testid="stSidebar"]')) return;
+    if (t.closest("button.ave-popover-open-sidebar")) return;
+    var cur = t;
+    for (var i = 0; i < 10 && cur; i++) {
+      if (isWidgetInteraction(cur)) {
+        onRerunExpected();
+        return;
+      }
+      cur = cur.parentElement;
+    }
+  }
+  boot();
+  document.addEventListener("pointerdown", onPointerDown, true);
+  try {
+    var pd = window.parent && window.parent.document;
+    if (pd && pd !== document) pd.addEventListener("pointerdown", onPointerDown, true);
+  } catch (e0) {}
+})();
+</script>
+        """,
+    )
+
+
+def _dock_blue_paint_script() -> None:
+    """Force the filter dock card to the light-blue gradient (theme CSS can override stylesheet :has() rules)."""
+    _html_main_script(
+        """
+<script>
+(function () {
+  var GRAD = "linear-gradient(180deg, #c4daf6 0%, #a8c8f0 52%, #8eb6e8 100%)";
+  function applyDock(el) {
+    el.style.setProperty("background", GRAD, "important");
+    el.style.setProperty("border", "1px solid #5a8ec8", "important");
+    el.style.setProperty("border-radius", "12px", "important");
+    el.style.setProperty("box-shadow", "inset 0 1px 0 rgba(255,255,255,0.65), 0 1px 3px rgba(30,58,95,0.12)", "important");
+    el.style.setProperty("padding", "0.45rem 0.75rem 0.6rem", "important");
+    el.style.setProperty("max-width", "var(--ave-explore-snippet-max)", "important");
+    el.style.setProperty("margin-left", "auto", "important");
+    el.style.setProperty("margin-right", "auto", "important");
+    el.style.setProperty("margin-top", "0.35rem", "important");
+    el.style.setProperty("margin-bottom", "0.65rem", "important");
+    el.style.setProperty("box-sizing", "border-box", "important");
+    el.classList.add("ave-chips-dock-frame");
+  }
+  function paint() {
+    var stats = document.querySelector(".ave-chips-dock-stats");
+    if (!stats) return;
+    var wraps = document.querySelectorAll(
+      '[data-testid="stVerticalBlockBorderWrapper"],[data-testid="stStyledVerticalBlockBorderWrapper"]'
+    );
+    for (var i = 0; i < wraps.length; i++) {
+      if (wraps[i].contains(stats)) {
+        applyDock(wraps[i]);
+        return;
+      }
+    }
+    var el = stats.parentElement;
+    for (var j = 0; j < 22 && el; j++) {
+      var tid = el.getAttribute && el.getAttribute("data-testid");
+      if (tid === "stVerticalBlockBorderWrapper" || tid === "stStyledVerticalBlockBorderWrapper") {
+        applyDock(el);
+        return;
+      }
+      el = el.parentElement;
+    }
+    var vb = stats.closest('[data-testid="stVerticalBlock"]');
+    if (vb && vb.querySelector('[data-testid="stHorizontalBlock"]')) {
+      applyDock(vb);
+    }
+  }
+  paint();
+  [0, 40, 120, 400, 1000, 2200].forEach(function (d) { setTimeout(paint, d); });
+  if (document.body) {
+    new MutationObserver(paint).observe(document.body, { childList: true, subtree: true });
+  }
+})();
+</script>
+        """,
+    )
+
+
+def _chip_bar_panel_script() -> None:
+    """Tag chip rows + blue frame from `.ave-chips-dock-stats` (robust across Streamlit DOM tweaks)."""
+    _html_main_script(
+        """
+<script>
+(function () {
+  function appDocument() {
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
+  }
+  function findBorderWrap(stats) {
+    let el = stats;
+    for (let i = 0; i < 16 && el; i++) {
+      const tid = el.getAttribute && el.getAttribute("data-testid");
+      if (tid === "stVerticalBlockBorderWrapper" || tid === "stStyledVerticalBlockBorderWrapper") return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+  function isChipRowFirst(hb) {
+    if (hb.querySelector("#ave-pin-toolbar")) return false;
+    const btns = hb.querySelectorAll('div[data-testid="column"] button');
+    if (btns.length < 4) return false;
+    const t0 = (btns[0].textContent || "").replace(/\\s+/g, " ").trim();
+    const t3 = (btns[3].textContent || "").replace(/\\s+/g, " ").trim();
+    return /Archetype/i.test(t0) && /Time/i.test(t3);
+  }
+  function isChipRowSecond(hb) {
+    if (hb.querySelector("#ave-pin-toolbar")) return false;
+    const btns = hb.querySelectorAll('div[data-testid="column"] button');
+    if (btns.length !== 2) return false;
+    const t0 = (btns[0].textContent || "").replace(/\\s+/g, " ").trim();
+    const t1 = (btns[1].textContent || "").replace(/\\s+/g, " ").trim();
+    return /Publication/i.test(t0) && /Keywords/i.test(t1);
   }
   function panelize() {
     const doc = appDocument();
     const main = doc.querySelector('[data-testid="stMain"]');
     if (!main) return;
-    const blocks = main.querySelectorAll('[data-testid="stHorizontalBlock"]');
-    const rows = [];
-    for (const hb of blocks) {
-      if (hb.querySelector("#ave-pin-toolbar")) continue;
-      rows.push(hb);
+    const stats = main.querySelector(".ave-chips-dock-stats");
+    if (!stats) return;
+    const wrap = findBorderWrap(stats);
+    if (wrap) wrap.classList.add("ave-chips-dock-frame");
+    main.querySelectorAll(".ave-chips-panel").forEach(function (hb) {
+      hb.classList.remove("ave-chips-panel", "ave-chips-panel--first", "ave-chips-panel--last");
+    });
+    const chipRows = [];
+    if (wrap) {
+      wrap.querySelectorAll('[data-testid="stHorizontalBlock"]').forEach(function (hb) {
+        if (hb.querySelector("#ave-pin-toolbar")) return;
+        const n = hb.querySelectorAll('div[data-testid="column"] button').length;
+        if (n === 4 || n === 2) chipRows.push(hb);
+      });
+    } else {
+      main.querySelectorAll('[data-testid="stHorizontalBlock"]').forEach(function (hb) {
+        if (isChipRowFirst(hb)) chipRows.push(hb);
+        else if (isChipRowSecond(hb)) chipRows.push(hb);
+      });
     }
-    for (let i = 0; i < rows.length; i++) {
-      const hb = rows[i];
-      hb.classList.remove("ave-chips-panel", "ave-sort-chip-row");
-      if (i === 0) {
-        hb.classList.add("ave-chips-panel");
-      }
-    }
+    chipRows.forEach(function (hb, idx) {
+      hb.classList.add("ave-chips-panel");
+      if (idx === 0) hb.classList.add("ave-chips-panel--first");
+      if (idx === chipRows.length - 1) hb.classList.add("ave-chips-panel--last");
+    });
   }
   panelize();
-  setInterval(panelize, 800);
+  requestAnimationFrame(function () { panelize(); });
+  setTimeout(panelize, 80);
+  setTimeout(panelize, 280);
+  setTimeout(panelize, 700);
   const doc = appDocument();
   const obs = new MutationObserver(function () { panelize(); });
-  obs.observe(doc.body, { childList: true, subtree: true });
+  if (doc.body) {
+    obs.observe(doc.body, { childList: true, subtree: true });
+  }
 })();
 </script>
         """,
-        height=0,
     )
 
 
 def _snippet_grid_responsive_script() -> None:
-    """Two-column snippet grid only when main column is wide enough; stricter when sidebar is expanded."""
-    components.html(
+    """Keep a single wide snippet column; set --ave-explore-snippet-max for toolbar/dock alignment."""
+    _html_main_script(
         """
 <script>
 (function () {
   function appDocument() {
-    try { return window.parent.document; } catch (e) { return document; }
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
   }
   function apply() {
-    const doc = appDocument();
-    const grid = doc.getElementById("ave-snippet-grid");
-    if (!grid) return;
-    const main = doc.querySelector('[data-testid="stMain"]');
-    if (!main) return;
-    const w = main.getBoundingClientRect().width;
-    const sb = doc.querySelector('[data-testid="stSidebar"]');
-    const expanded = sb && sb.getAttribute("aria-expanded") === "true";
-    /* Two columns only when each card column can be comfortably wide (~min 28–30rem total). */
-    const threshold = expanded ? 1200 : 1000;
-    grid.classList.toggle("ave-snippet-grid--two", w >= threshold);
+    try {
+      const doc = appDocument();
+      const main = doc.querySelector('[data-testid="stMain"]');
+      if (!main) return;
+      const docEl = doc.documentElement;
+      if (docEl) {
+        docEl.style.setProperty("--ave-explore-snippet-max", "min(72rem, 100%)");
+      }
+      let grid = doc.getElementById("ave-snippet-grid");
+      if (!grid) grid = main.querySelector(".ave-snippet-grid-root");
+      if (!grid) grid = main.querySelector(".ave-snippet-grid");
+      if (grid) grid.classList.remove("ave-snippet-grid--two");
+      if (docEl) docEl.classList.remove("ave-snippet-pair-two-col");
+    } catch (e) {}
   }
   apply();
   setInterval(apply, 450);
   const doc = appDocument();
-  window.parent.addEventListener("resize", apply, true);
+  try {
+    window.parent.addEventListener("resize", apply, true);
+  } catch (e) {}
   doc.addEventListener("click", function () { setTimeout(apply, 150); }, true);
-  const obs = new MutationObserver(apply);
-  obs.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["aria-expanded", "class"] });
+  if (doc.body) {
+    const obs = new MutationObserver(apply);
+    obs.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["aria-expanded", "class"] });
+  }
 })();
 </script>
         """,
-        height=0,
     )
 
 
 def _main_chips_expand_sidebar_script() -> None:
     """When sidebar is collapsed, a chip click should expand it (header control lives outside sidebar)."""
-    components.html(
+    _html_main_script(
         """
 <script>
 (function () {
   function appDocument() {
-    try { return window.parent.document; } catch (e) { return document; }
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
+  }
+  function clickExpandControl(doc) {
+    const expand =
+      doc.querySelector('[data-testid="stExpandSidebarButton"]')
+      || doc.querySelector('[data-testid="collapsedControl"] button')
+      || doc.querySelector('[data-testid="collapsedControl"] a')
+      || doc.querySelector('button[aria-label*="sidebar" i]')
+      || doc.querySelector('button[title*="sidebar" i]');
+    if (expand && expand.offsetParent !== null) {
+      expand.click();
+      return true;
+    }
+    return false;
   }
   function onClick(ev) {
     const doc = appDocument();
     const t = ev.target;
     if (!t || !t.closest) return;
-    const btn = t.closest("button");
+    const btn = t.closest("button") || t.closest('[role="button"]');
     if (!btn) return;
-    const hb = btn.closest('[data-testid="stHorizontalBlock"]');
-    if (!hb || !hb.classList.contains("ave-chips-panel")) return;
     const main = doc.querySelector('[data-testid="stMain"]');
     if (!main || !main.contains(btn)) return;
-    const expand = doc.querySelector('[data-testid="stExpandSidebarButton"]');
-    if (expand && expand.offsetParent !== null) {
-      expand.click();
+    const stats = main.querySelector(".ave-chips-dock-stats");
+    let inDock = false;
+    if (stats) {
+      let wrap = stats.closest('[data-testid="stVerticalBlockBorderWrapper"]')
+        || stats.closest('[data-testid="stStyledVerticalBlockBorderWrapper"]');
+      if (!wrap) {
+        let el = stats.parentElement;
+        for (let i = 0; i < 14 && el; i++) {
+          const tid = el.getAttribute && el.getAttribute("data-testid");
+          if (tid === "stVerticalBlockBorderWrapper" || tid === "stStyledVerticalBlockBorderWrapper") {
+            wrap = el;
+            break;
+          }
+          el = el.parentElement;
+        }
+      }
+      if (wrap && wrap.contains(btn)) inDock = true;
     }
+    const hb = btn.closest('[data-testid="stHorizontalBlock"]');
+    const byClass = hb && (hb.classList.contains("ave-chips-panel") || hb.classList.contains("ave-mobile-filters-strip"));
+    const txt = (btn.textContent || "").replace(/\\s+/g, " ").trim();
+    const looksLikeFilterChip = /^(🎭|🔮|🗣️|📅|📰|🔎)/.test(txt)
+      || /\\b(Archetype|Vision|Stance|Time|Publication|Keywords)\\b/i.test(txt);
+    let go = inDock || byClass;
+    if (!go && looksLikeFilterChip && hb) go = true;
+    if (!go) return;
+    clickExpandControl(doc);
   }
   const doc = appDocument();
   doc.addEventListener("click", onClick, true);
 })();
 </script>
         """,
-        height=0,
+    )
+
+
+def _expand_sidebar_button_label_script() -> None:
+    """Keep aria-label/title in sync with the themed menu-style expand control."""
+    _html_main_script(
+        """
+<script>
+(function () {
+  function appDocument() {
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
+  }
+  const label = "Open filter sidebar";
+  function apply() {
+    const doc = appDocument();
+    const btn = doc.querySelector('[data-testid="stExpandSidebarButton"]');
+    if (!btn) return;
+    btn.setAttribute("aria-label", label);
+    btn.setAttribute("title", label);
+  }
+  apply();
+  setTimeout(apply, 40);
+  setInterval(apply, 600);
+  const doc = appDocument();
+  if (doc.body) {
+    new MutationObserver(apply).observe(doc.body, { childList: true, subtree: true });
+  }
+})();
+</script>
+        """,
+    )
+
+
+def _popover_adjust_filters_client_script() -> None:
+    """List options → Adjust filters: expand sidebar + dismiss popover in the browser (no full-app rerun)."""
+    _html_main_script(
+        """
+<script>
+(function () {
+  function appDocument() {
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
+  }
+  var doc = appDocument();
+  if (doc.documentElement.dataset.avePopoverAdjustFilters === "1") return;
+  doc.documentElement.dataset.avePopoverAdjustFilters = "1";
+  function clickExpandSidebar() {
+    var ex =
+      doc.querySelector('[data-testid="stExpandSidebarButton"]')
+      || doc.querySelector('[data-testid="collapsedControl"] button')
+      || doc.querySelector('[data-testid="collapsedControl"] a');
+    if (ex && ex.offsetParent !== null) {
+      ex.click();
+      return true;
+    }
+    return false;
+  }
+  function fireEscape() {
+    var ev = new KeyboardEvent("keydown", {
+      key: "Escape",
+      code: "Escape",
+      keyCode: 27,
+      which: 27,
+      bubbles: true,
+      cancelable: true
+    });
+    try {
+      if (doc.activeElement) doc.activeElement.dispatchEvent(ev);
+    } catch (e1) {}
+    doc.body.dispatchEvent(ev);
+    doc.dispatchEvent(ev);
+  }
+  doc.addEventListener(
+    "click",
+    function (ev) {
+      var t = ev.target;
+      if (!t || !t.closest) return;
+      var btn = t.closest("button.ave-popover-open-sidebar");
+      if (!btn) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      ev.stopImmediatePropagation();
+      clickExpandSidebar();
+      setTimeout(fireEscape, 0);
+      setTimeout(fireEscape, 40);
+      setTimeout(fireEscape, 100);
+    },
+    true
+  );
+})();
+</script>
+        """,
+    )
+
+
+def _collapse_sidebar_script() -> None:
+    """Programmatically collapse the Streamlit sidebar (no Python API — click the real collapse control)."""
+    _html_main_script(
+        """
+<script>
+(function () {
+  function appDocument() {
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
+  }
+  function clickCollapse(doc) {
+    const sb = doc.querySelector('[data-testid="stSidebar"]');
+    if (!sb || sb.getAttribute("aria-expanded") !== "true") return false;
+    /* Streamlit >=1.30: wrapper is data-testid="stSidebarCollapseButton" (not stCollapseSidebarButton). */
+    const collapseHost =
+      doc.querySelector('[data-testid="stSidebarCollapseButton"]')
+      || doc.querySelector('[data-testid="stCollapseSidebarButton"]');
+    if (collapseHost) {
+      const innerBtn = collapseHost.matches("button")
+        ? collapseHost
+        : collapseHost.querySelector("button");
+      if (innerBtn) {
+        innerBtn.click();
+        return true;
+      }
+      collapseHost.click();
+      return true;
+    }
+    for (const b of sb.querySelectorAll("button")) {
+      const al = ((b.getAttribute("aria-label") || "") + " " + (b.getAttribute("title") || "")).toLowerCase();
+      if (al.includes("collapse") && al.includes("sidebar")) {
+        b.click();
+        return true;
+      }
+      if (al.includes("close") && al.includes("sidebar")) {
+        b.click();
+        return true;
+      }
+    }
+    const hdr = doc.querySelector('[data-testid="stHeader"]');
+    if (hdr) {
+      for (const b of hdr.querySelectorAll("button")) {
+        const al = ((b.getAttribute("aria-label") || "") + " " + (b.getAttribute("title") || "")).toLowerCase();
+        if (al.includes("collapse") && al.includes("sidebar")) {
+          b.click();
+          return true;
+        }
+      }
+    }
+    /* Last resort: first short-label button in sidebar header row (collapse chevron). */
+    const sbr = sb.getBoundingClientRect();
+    for (const b of sb.querySelectorAll("button")) {
+      const br = b.getBoundingClientRect();
+      if (br.top > sbr.top + 80 || br.height <= 0 || br.width <= 0) continue;
+      const txt = (b.textContent || "").replace(/\\s+/g, " ").trim();
+      if (txt.length > 20) continue;
+      b.click();
+      return true;
+    }
+    return false;
+  }
+  function run() {
+    const doc = appDocument();
+    clickCollapse(doc);
+  }
+  const delays = [0, 30, 90, 200, 450, 900];
+  for (let i = 0; i < delays.length; i++) {
+    setTimeout(run, delays[i]);
+  }
+})();
+</script>
+        """,
+    )
+
+
+def _mobile_filters_strip_script() -> None:
+    """Tag the main-area Apply filters / Reset row so CSS can show it only on narrow viewports."""
+    _html_main_script(
+        """
+<script>
+(function () {
+  function appDocument() {
+    try {
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    } catch (e) {}
+    return document;
+  }
+  function mark() {
+    const doc = appDocument();
+    const main = doc.querySelector('[data-testid="stMain"]');
+    if (!main) return;
+    for (const b of main.querySelectorAll("button")) {
+      const t = (b.textContent || "").replace(/\\s+/g, " ").trim();
+      if (!t.includes("Apply filters")) continue;
+      const hb = b.closest('[data-testid="stHorizontalBlock"]');
+      if (hb) hb.classList.add("ave-mobile-filters-strip");
+      return;
+    }
+  }
+  mark();
+  setTimeout(mark, 80);
+  setInterval(mark, 400);
+  const doc = appDocument();
+  if (doc.body) {
+    new MutationObserver(mark).observe(doc.body, { childList: true, subtree: true });
+  }
+})();
+</script>
+        """,
     )
 
 
 def _sidebar_scroll_to_focus_script(focus_key: str | None) -> None:
-    """Scroll sidebar so the focused section is visible; flash-highlight it (also when sidebar already open)."""
+    """Scroll sidebar so the focused section is visible; flash-highlight it (also when sidebar already open).
+
+    Uses the order of **top-level** ``st.expander`` blocks in the sidebar (nested reference expander is skipped).
+    Avoids text search over arbitrary nodes — that previously matched captions like “Snippet sort order” and
+    mis-scrolled away from the real filter controls.
+    """
     if not focus_key:
         return
-    needles = {
-        "time": "Time range",
-        "primary": "Archetype, stance & vision",
-        "keywords": "Keywords",
-        "display": "Publication & sort",
-    }
-    needle = needles.get(focus_key)
-    if not needle:
-        return
-    needle_js = json.dumps(needle)
-    components.html(
+    fk_js = json.dumps(focus_key)
+    _html_main_script(
         f"""
 <script>
 (function () {{
-  const needle = {needle_js};
+  const FOCUS = {fk_js};
+  const ORDER = ["primary", "time", "keywords", "display"];
   function flashEl(node) {{
     if (!node) return;
+    /* Re-trigger animation every time (e.g. sidebar already open — user still gets feedback). */
+    node.classList.remove("ave-sidebar-section-flash");
+    void node.offsetWidth;
     node.classList.add("ave-sidebar-section-flash");
     setTimeout(function () {{
       node.classList.remove("ave-sidebar-section-flash");
     }}, 2400);
   }}
-  function run() {{
-    try {{
-      const doc = window.parent.document;
-      const content = doc.querySelector('[data-testid="stSidebarContent"]');
-      if (!content) return;
-      const candidates = content.querySelectorAll("summary, button, span, p, label, div");
-      for (const el of candidates) {{
-        const text = (el.textContent || "").trim();
-        if (text.length > 0 && text.length < 200 && text.includes(needle)) {{
-          const details = el.closest("details");
-          const expander = el.closest('[data-testid="stExpander"]');
-          if (details && !details.open) {{
-            details.open = true;
-          }} else if (expander) {{
-            const sum = expander.querySelector("summary");
-            const aria = expander.querySelector('[aria-expanded="false"]');
-            if (aria) aria.click();
-            else if (sum) sum.click();
-          }}
-          el.scrollIntoView({{ block: "center", behavior: "smooth" }});
-          if (details) {{
-            flashEl(details);
-          }} else if (expander) {{
-            flashEl(expander);
-          }} else {{
-            const block = el.closest('[data-testid="stVerticalBlock"]');
-            if (block) flashEl(block);
-          }}
-          return;
-        }}
-      }}
-    }} catch (e) {{}}
+  function openExpander(exp) {{
+    if (!exp) return;
+    const det = exp.querySelector("details");
+    if (det) {{
+      if (!det.open) det.open = true;
+      return;
+    }}
+    const ariaFalse = exp.querySelector('[aria-expanded="false"]');
+    if (ariaFalse) ariaFalse.click();
+    /* Do not click summary when already open — that toggles the section closed. */
   }}
-  setTimeout(run, 80);
-  setTimeout(run, 280);
-  setTimeout(run, 600);
-  setTimeout(run, 1100);
+  function appDoc() {{
+    try {{
+      var pd = window.parent && window.parent.document;
+      if (pd && pd.querySelector('[data-testid="stMain"]')) return pd;
+    }} catch (e) {{}}
+    return document;
+  }}
+  function topLevelExpanders(content) {{
+    const all = Array.from(content.querySelectorAll('[data-testid="stExpander"]'));
+    return all.filter(function (exp) {{
+      let p = exp.parentElement;
+      while (p && p !== content) {{
+        if (p.getAttribute && p.getAttribute("data-testid") === "stExpander") return false;
+        p = p.parentElement;
+      }}
+      return true;
+    }});
+  }}
+  function fallbackBySummary(content, ix) {{
+    const hints = [
+      [/Archetype/i, /Vision/i, /Stance/i],
+      [/Time range/i],
+      [/Keywords/i],
+      [/Publication/i],
+    ];
+    const need = hints[ix];
+    if (!need) return null;
+    const top = topLevelExpanders(content);
+    for (const exp of top) {{
+      const sum = exp.querySelector("summary");
+      const lab = ((sum && sum.textContent) || "").replace(/\\s+/g, " ");
+      let ok = true;
+      for (let j = 0; j < need.length; j++) {{
+        if (!need[j].test(lab)) {{ ok = false; break; }}
+      }}
+      if (ok) return exp;
+    }}
+    return top[ix] || null;
+  }}
+  function clickExpandSidebarIfCollapsed(doc) {{
+    /* Sidebar collapsed: expand control is in the header — scroll script alone cannot reveal filters. */
+    const ex =
+      doc.querySelector('[data-testid="stExpandSidebarButton"]')
+      || doc.querySelector('[data-testid="collapsedControl"] button')
+      || doc.querySelector('[data-testid="collapsedControl"] a');
+    if (ex && ex.offsetParent !== null) {{
+      ex.click();
+      return true;
+    }}
+    return false;
+  }}
+  function run() {{
+    const doc = appDoc();
+    clickExpandSidebarIfCollapsed(doc);
+    const content =
+      doc.querySelector('[data-testid="stSidebarContent"]')
+      || doc.querySelector('[data-testid="stSidebar"]');
+    if (!content) return;
+    const ix = ORDER.indexOf(FOCUS);
+    if (ix < 0) return;
+    const top = topLevelExpanders(content);
+    let exp = top.length > ix ? top[ix] : null;
+    if (!exp) exp = fallbackBySummary(content, ix);
+    if (!exp) return;
+    openExpander(exp);
+    exp.scrollIntoView({{ block: "center", behavior: "smooth" }});
+    flashEl(exp);
+  }}
+  setTimeout(run, 50);
+  setTimeout(run, 200);
+  setTimeout(run, 500);
+  setTimeout(run, 1000);
+  setTimeout(run, 1800);
 }})();
 </script>
         """,
-        height=0,
     )
 
 
@@ -1449,6 +3642,32 @@ def _render_keyword_wordcloud(
     st.pyplot(fig, clear_figure=True, use_container_width=False)
     plt.close(fig)
     return True
+
+
+def _reprint_occurrences_dataframe(pn: str, full_df: pd.DataFrame) -> pd.DataFrame:
+    """Rows in ``full_df`` with the same normalized paragraph key (current filter)."""
+    sub = full_df[full_df["_ave_para_norm"] == pn].copy()
+    cols = [
+        c
+        for c in [
+            "date",
+            "publication",
+            "title",
+            "__article_key",
+            "paragraph_id",
+            "year",
+            "month",
+            "future_type_prediction",
+            "archetype",
+            "majority_stance",
+            "paragraph",
+        ]
+        if c in sub.columns
+    ]
+    show = sub[cols].copy()
+    if "date" in show.columns:
+        show["date"] = pd.to_datetime(show["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return show
 
 
 def _apply_sort(out: pd.DataFrame, sort_by: str, *, csv_path: str | None = None) -> pd.DataFrame:
@@ -1509,7 +3728,16 @@ def _dashboard_csv_path(project_root: str) -> str:
 
 
 def main() -> None:
-    _page_icon = _BRAND_ICON_PATH if os.path.isfile(_BRAND_ICON_PATH) else "🔭"
+    # Browser tab icon: small PNG favicon (see assets/favicon.png); fallback to full icon or SVG.
+    _page_icon = (
+        _FAVICON_PATH
+        if os.path.isfile(_FAVICON_PATH)
+        else (
+            _BRAND_ICON_PATH
+            if os.path.isfile(_BRAND_ICON_PATH)
+            else (_BRAND_SVG_PATH if os.path.isfile(_BRAND_SVG_PATH) else "🔭")
+        )
+    )
     st.set_page_config(
         page_title="AI Vision Explorer",
         page_icon=_page_icon,
@@ -1519,6 +3747,45 @@ def main() -> None:
 
     if not _check_password():
         return
+
+    if AVE_SHOW_GUIDE_KEY not in st.session_state:
+        st.session_state[AVE_SHOW_GUIDE_KEY] = False
+    # Legacy ``?guide=1`` URLs: move to session state (soft rerun; keeps sign-in).
+    try:
+        if st.query_params.get("guide") == "1":
+            st.session_state[AVE_SHOW_GUIDE_KEY] = True
+            if "guide" in st.query_params:
+                del st.query_params["guide"]
+            st.rerun()
+    except Exception:
+        pass
+    # Explanations “Explore this →” uses ``<a href="?ave_explore=…">`` (see ``guide_content``) — apply filters, leave guide, strip param.
+    try:
+        if "ave_explore" in st.query_params:
+            _ae = st.query_params.get("ave_explore")
+            if isinstance(_ae, list):
+                _ae = _ae[0] if _ae else ""
+            _ae = str(_ae).strip()
+            if _ae:
+                _apply_ave_explore_query_param(_ae)
+            del st.query_params["ave_explore"]
+            st.rerun()
+    except Exception:
+        pass
+    if st.session_state[AVE_SHOW_GUIDE_KEY]:
+        _inject_branding_css()
+        _gb_cols = st.columns([1])
+        with _gb_cols[0]:
+            if st.button("← Back to dashboard", key="ave_back_guide", use_container_width=False):
+                st.session_state[AVE_SHOW_GUIDE_KEY] = False
+                st.rerun()
+        st.markdown(
+            '<div id="ave-guide-back-flow-spacer" class="ave-guide-back-flow-spacer" aria-hidden="true"></div>',
+            unsafe_allow_html=True,
+        )
+        _guide_back_row_script()
+        render_guide_page()
+        st.stop()
 
     csv_path = _dashboard_csv_path(_PROJECT_ROOT)
 
@@ -1536,6 +3803,11 @@ def main() -> None:
         st.stop()
 
     para_dup_stats = paragraph_duplicate_metrics(df, csv_path=csv_path, dashboard_dir=_DASHBOARD_DIR)
+
+    # Distinct filter values (reuse for multiselect options + post-widget sanitization).
+    _filter_opts_arch = sorted(df["archetype"].dropna().unique().tolist())
+    _filter_opts_vision = sorted(df["future_type_prediction"].dropna().unique().tolist())
+    _filter_opts_stance = sorted(df["majority_stance"].dropna().unique().tolist())
 
     # ----- Date bounds & session defaults -----
     date_min = df["date"].min()
@@ -1564,7 +3836,9 @@ def main() -> None:
     if "dash_stances" not in st.session_state:
         st.session_state["dash_stances"] = []
     if "dash_vision" not in st.session_state:
-        st.session_state["dash_vision"] = "All"
+        st.session_state["dash_vision"] = []
+    else:
+        st.session_state["dash_vision"] = _normalize_dash_visions(st.session_state.get("dash_vision"))
     if "dash_pub" not in st.session_state:
         st.session_state["dash_pub"] = "All"
     if "dash_sort" not in st.session_state:
@@ -1575,6 +3849,8 @@ def main() -> None:
         st.session_state["dash_chart_y_mode"] = "Absolute counts (by publication)"
     if "dash_word_profile" not in st.session_state:
         st.session_state["dash_word_profile"] = "Distinctive vs full corpus"
+    if "dash_dedupe_paragraphs" not in st.session_state:
+        st.session_state["dash_dedupe_paragraphs"] = True
     if st.session_state.get("dash_chart_y_mode") == "Filter share of month (%)":
         st.session_state["dash_chart_y_mode"] = "Filter vs rest of month (stacked)"
     _chart_mode_opts = frozenset({"Absolute counts (by publication)", "Filter vs rest of month (stacked)"})
@@ -1600,7 +3876,7 @@ def main() -> None:
         st.session_state["dash_time_mode"] = "Year & month"
         st.session_state["dash_archetypes"] = []
         st.session_state["dash_stances"] = []
-        st.session_state["dash_vision"] = "All"
+        st.session_state["dash_vision"] = []
         st.session_state["dash_pub"] = "All"
         st.session_state["dash_sort"] = "Date (newest first)"
         st.session_state["dash_match_all"] = False
@@ -1619,39 +3895,65 @@ def main() -> None:
     <div>
       <p class="sb-title">AI Vision Explorer</p>
       <p class="sb-sub">HBR · MIT SMR</p>
+      <p class="sb-guide-hint sb-guide-hint-full">Concepts &amp; categories: open <strong>Explanations</strong> (top right, next to the title).</p>
+      <p class="sb-guide-hint sb-guide-hint-short">Use <strong>Explanations</strong> (top right) for concepts &amp; categories.</p>
     </div>
   </div>
 </div>
         """,
         unsafe_allow_html=True,
     )
+    st.sidebar.markdown(
+        '<p class="ave-sidebar-filters-heading">Filters</p>',
+        unsafe_allow_html=True,
+    )
 
-    page_size = int(st.session_state.get("dash_page_size", 50))
+    _ps_raw = st.session_state.get("dash_page_size", 50)
+    try:
+        page_size = int(_ps_raw)
+    except (TypeError, ValueError):
+        page_size = 50
+    page_size = max(1, min(200, page_size))
 
     _inject_branding_css()
     _sidebar_dock_script()
     _v2a_multiselect_mute_script()
     _chip_bar_panel_script()
-    _snippet_grid_responsive_script()
-    _main_chips_expand_sidebar_script()
+    _dock_blue_paint_script()
+    _expl_title_row_script()
+    _loading_overlay_script()
+    # Disabled: capture-phase click handlers / MutationObservers interfered with Streamlit widget
+    # hit-testing in production (buttons dead, snippets not updating). Re-enable only after testing.
+    # _snippet_grid_responsive_script()
+    # _main_chips_expand_sidebar_script()
+    _expand_sidebar_button_label_script()
+    # _popover_adjust_filters_client_script()
+    _mobile_filters_strip_script()
 
     focus = st.session_state.get(_FILTER_FOCUS_KEY)
 
     with st.sidebar:
-        with st.expander("🎯 Archetype, stance & vision", expanded=(focus in (None, "primary"))):
+        with st.expander("🎭 Archetype · Vision · Stance", expanded=(focus in (None, "primary"))):
             if focus == "primary":
                 st.markdown(
                     '<div class="ave-flash-target" style="font-weight:600;color:#1a3344;margin-bottom:0.5rem;">'
                     "Archetype / stance / vision — adjust below</div>",
                     unsafe_allow_html=True,
                 )
+            arch_opts = _filter_opts_arch
+            vision_opts = _filter_opts_vision
+            stance_opts = _filter_opts_stance
+            _repair_format_multiselect_state("dash_archetypes", arch_opts)
+            _repair_format_multiselect_state("dash_vision", vision_opts)
+            _repair_format_multiselect_state("dash_stances", stance_opts)
+
             _arch_pick = set(st.session_state.get("dash_archetypes", []))
             _stance_pick = set(st.session_state.get("dash_stances", []))
-            _vision_prev = st.session_state.get("dash_vision", "All")
+            _vision_prev = _normalize_dash_visions(st.session_state.get("dash_vision"))
             if _stance_pick:
-                _compat_ar = compatible_archetypes_for_stances(_stance_pick, _vision_prev)
-            elif _vision_prev != "All":
-                _compat_ar = compatible_archetypes_for_vision(_vision_prev)
+                _compat_ar = compatible_archetypes_for_stances_with_visions(_stance_pick, _vision_prev)
+            elif _vision_prev:
+                _compat_ar = compatible_archetypes_for_visions_union(_vision_prev)
             else:
                 _compat_ar = None
             _compat_vis = compatible_visions_for_filters(_arch_pick, _stance_pick)
@@ -1662,13 +3964,10 @@ def main() -> None:
                 return f"○ {opt}" if opt not in _compat_ar else f"● {opt}"
 
             def _fmt_vision_label(opt: str) -> str:
-                if opt == "All":
-                    return "All"
                 if _compat_vis is None:
                     return opt
                 return f"○ {opt}" if opt not in _compat_vis else f"● {opt}"
 
-            arch_opts = sorted(df["archetype"].dropna().unique().tolist())
             archetypes = st.multiselect(
                 "Archetype",
                 options=arch_opts,
@@ -1677,25 +3976,28 @@ def main() -> None:
                 help="Empty = all archetypes. ● = can occur with your current stance selection (given vision scope); "
                 "○ = off that mapping (still selectable).",
             )
-            vision_opts = ["All"] + sorted(df["future_type_prediction"].dropna().unique().tolist())
-            vision = st.selectbox(
+            st.multiselect(
                 "Vision type",
                 vision_opts,
                 key="dash_vision",
                 format_func=_fmt_vision_label,
-                help="Future / division type column. ● = can occur with your current archetype and stance picks "
-                "under the table; ○ = off that joint mapping (still selectable). 'All' is unlabeled.",
+                help="Empty = all vision types. ● = can occur with your current archetype and stance picks "
+                "under the table; ○ = off that joint mapping (still selectable).",
             )
-            if vision != "All" and vision in VISION_TO_ARCHETYPES:
-                st.caption(
-                    "Archetypes possible for this vision (depends on stance): "
-                    + ", ".join(VISION_TO_ARCHETYPES[vision])
-                )
+            visions = _normalize_dash_visions(st.session_state.get("dash_vision"))
+            if visions:
+                _cap_vis = [
+                    f"{v}: " + ", ".join(VISION_TO_ARCHETYPES[v])
+                    for v in sorted(visions)
+                    if v in VISION_TO_ARCHETYPES
+                ]
+                if _cap_vis:
+                    st.caption("Archetypes possible per vision (depend on stance) — " + " · ".join(_cap_vis))
 
             if _arch_pick:
-                _compat_st = compatible_stances_for_archetypes(_arch_pick, vision)
-            elif vision != "All":
-                _compat_st = compatible_stances_for_vision(vision)
+                _compat_st = compatible_stances_for_archetypes_with_visions(_arch_pick, visions)
+            elif visions:
+                _compat_st = compatible_stances_for_visions_union(visions)
             else:
                 _compat_st = None
 
@@ -1704,13 +4006,12 @@ def main() -> None:
                     return opt
                 return f"○ {opt}" if opt not in _compat_st else f"● {opt}"
 
-            stance_opts = sorted(df["majority_stance"].dropna().unique().tolist())
             stances = st.multiselect(
                 "Rhetorical stance",
                 options=stance_opts,
                 key="dash_stances",
                 format_func=_fmt_stance_label,
-                help="Empty = all stances. ● = can produce your current archetype selection under the chosen vision; "
+                help="Empty = all stances. ● = can produce your current archetype selection under the chosen vision(s); "
                 "○ = no table row maps those archetypes to this stance (still selectable).",
             )
             if _compat_st is not None or _compat_ar is not None or _compat_vis is not None:
@@ -1719,12 +4020,13 @@ def main() -> None:
                     "**○** = off that mapping (muted); still clickable for strict AND filters."
                 )
             with st.expander("Vision → archetypes (reference table)", expanded=False):
+                st.caption("Paper mapping · vision × stance → archetype (full grid under **Explanations**).")
                 lines = [
                     f"- {v}: " + ", ".join(arches) for v, arches in VISION_TO_ARCHETYPES.items()
                 ]
                 st.markdown("\n".join(lines))
 
-        with st.expander("⏱ Time range", expanded=(focus == "time")):
+        with st.expander("📅 Time range", expanded=(focus == "time")):
             if focus == "time":
                 st.markdown(
                     '<div class="ave-flash-target" style="font-weight:600;color:#1a3344;margin-bottom:0.5rem;">'
@@ -1791,15 +4093,18 @@ def main() -> None:
             pubs = ["All"] + sorted(df["publication"].dropna().unique().tolist())
             pub = st.selectbox("Publication", pubs, key="dash_pub")
             st.caption(
-                "Snippet **sort order** is in the bar above the list (with Previous / Next); it stays visible when you scroll."
+                "Snippet **sort order** and **per page** are under **List options**; **Clear filters** and **Adjust filters** sit at the bottom of that menu. The header menu button (vertical bars) also opens the sidebar. The bar stays visible when you scroll."
             )
-    if st.session_state.pop(_SCROLL_SIDEBAR_KEY, False):
-        _sidebar_scroll_to_focus_script(st.session_state.get(_FILTER_FOCUS_KEY))
+
+    # Widget return values can still carry formatted/stale labels; sanitize before filtering.
+    archetypes = _sanitize_multiselect_against_options(list(archetypes), _filter_opts_arch)
+    stances = _sanitize_multiselect_against_options(list(stances), _filter_opts_stance)
+    visions = _sanitize_multiselect_against_options(list(visions), _filter_opts_vision)
 
     sort_by = st.session_state.get("dash_sort", "Date (newest first)")
 
     out_base, df_time_only = _apply_filters_unsorted(
-        df, time_mode, list(archetypes), list(stances), vision, pub, kw, match_all
+        df, time_mode, list(archetypes), list(stances), visions, pub, kw, match_all
     )
     n_total = len(df)
     n_match = len(out_base)
@@ -1810,89 +4115,127 @@ def main() -> None:
     out = _apply_sort(out_base, sort_by, csv_path=csv_path)
     sum_stats = article_summary_stats(out)
 
-    if _icon_uri:
-        st.markdown(
-            "<div class='ave-main-strip'><span class='ave-main-strip-inner'>"
-            f"<img class='ave-strip-icon' src='{_icon_uri}' alt='' /> "
-            "<strong>AI Vision Explorer</strong></span></div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            "<div class='ave-main-strip'>🔭 &nbsp; <strong>AI Vision Explorer</strong></div>",
-            unsafe_allow_html=True,
-        )
+    dedupe_paragraphs = bool(st.session_state.get("dash_dedupe_paragraphs", True))
+    _dedupe_ctx = (
+        st.spinner("Preparing snippet list…")
+        if (dedupe_paragraphs and len(out) > 3500)
+        else contextlib.nullcontext()
+    )
+    with _dedupe_ctx:
+        if dedupe_paragraphs:
+            out_list, out_full = dedupe_sorted_paragraph_rows(out)
+        else:
+            out_list = out
+            out_full = None
+
+    # Title + Explanations: one HTML flex row (`?guide=1` opens Explanations — see guide query handler above).
+    st.markdown(_explorer_title_bar_row_html(_icon_uri), unsafe_allow_html=True)
+
     st.markdown('<div id="ave-top" style="height:1px;margin:0;padding:0;"></div>', unsafe_allow_html=True)
     _jm = "ALL" if match_all else "ANY"
     _kw_chip = (kw or "").strip() or "—"
-    _vis_chip = vision if vision != "All" else "All"
-    st.markdown(
-        '<div class="ave-chips-dock-stats"><div class="ave-chip-stats-summary" title="Current filter vs full loaded corpus">'
-        '<span class="ave-chip-stats-lead" aria-hidden="true">📊</span>'
-        f"<span>{n_match:,}</span> / {n_total:,} snippets"
-        f" · <span>{n_art_match:,}</span> articles"
-        f" · <em>{pct_corpus:.1f}%</em> of corpus"
-        f" · {snip_per_article_line:.2f} snip/article</div></div>",
-        unsafe_allow_html=True,
-    )
-    # Hierarchy: archetype → vision → stance → time → publication → keywords (sort is in snippet toolbar).
-    j1, j2, j3, j4, j5, j6 = st.columns([1.15, 1, 1, 1, 1, 1])
-    with j1:
-        st.button(
-            _chip_panel_line("Archetype", _fmt_multi_chip(archetypes), emoji="🎭", max_len=22),
-            on_click=_nav_primary_cb,
-            key="main_nav_arch",
-            use_container_width=True,
-        )
-    with j2:
-        st.button(
-            _chip_panel_line("Vision type", _vis_chip, emoji="🔮", max_len=24),
-            on_click=_nav_primary_cb,
-            key="main_nav_vision",
-            use_container_width=True,
-        )
-    with j3:
-        st.button(
-            _chip_panel_line("Stance", _fmt_multi_chip(stances), emoji="🗣️", max_len=22),
-            on_click=_nav_primary_cb,
-            key="main_nav_stance",
-            use_container_width=True,
-        )
-    with j4:
-        st.button(
-            _chip_panel_line("Time", date_label, emoji="📅", max_len=30),
-            on_click=_nav_time_cb,
-            key="main_nav_time",
-            use_container_width=True,
-        )
-    with j5:
-        st.button(
-            _chip_panel_line("Publication", pub, emoji="📰", max_len=22),
-            on_click=_nav_display_cb,
-            key="main_nav_pub",
-            use_container_width=True,
-        )
-    with j6:
-        st.button(
-            _chip_panel_line("Keywords", f"{_jm} · {_trunc_ui(_kw_chip, 20)}", emoji="🔎", max_len=26),
-            on_click=_nav_keywords_cb,
-            key="main_nav_kw",
-            use_container_width=True,
-        )
+    _time_chip = _time_chip_display(date_label)
+    # Filter chips only at top — corpus / dedupe counts live at the bottom (see Corpus & counts expander).
+    # Outer keyed container constrains width on wide viewports (same as snippet grid); border lives inside.
+    with st.container(key="ave_chips_dock_width"):
+        with st.container(border=True):
+            # Two rows (4 + 2 cols) so chips never flex-wrap to a staggered third row.
+            j1, j2, j3, j4 = st.columns(4)
+            with j1:
+                st.button(
+                    _chip_panel_line("Archetype", _fmt_multi_chip(archetypes), emoji="🎭", max_len=22),
+                    on_click=_nav_primary_cb,
+                    key="main_nav_arch",
+                    use_container_width=True,
+                )
+            with j2:
+                st.button(
+                    _chip_panel_line("Vision", _fmt_multi_chip(visions, max_len=18), emoji="🔮", max_len=18),
+                    on_click=_nav_primary_cb,
+                    key="main_nav_vision",
+                    use_container_width=True,
+                )
+            with j3:
+                st.button(
+                    _chip_panel_line("Stance", _fmt_multi_chip(stances), emoji="🗣️", max_len=22),
+                    on_click=_nav_primary_cb,
+                    key="main_nav_stance",
+                    use_container_width=True,
+                )
+            with j4:
+                st.button(
+                    _chip_panel_line("Time", _time_chip, emoji="📅", max_len=24),
+                    on_click=_nav_time_cb,
+                    key="main_nav_time",
+                    use_container_width=True,
+                )
+            j5, j6 = st.columns([1, 1])
+            with j5:
+                st.button(
+                    _chip_panel_line("Publication", pub, emoji="📰", max_len=22),
+                    on_click=_nav_display_cb,
+                    key="main_nav_pub",
+                    use_container_width=True,
+                )
+            with j6:
+                st.button(
+                    _chip_panel_line("Keywords", f"{_jm} · {_trunc_ui(_kw_chip, 20)}", emoji="🔎", max_len=26),
+                    on_click=_nav_keywords_cb,
+                    key="main_nav_kw",
+                    use_container_width=True,
+                )
+            j7, j8 = st.columns(2)
+            with j7:
+                st.button(
+                    "⚙️ Open filters",
+                    on_click=_nav_primary_cb,
+                    key="main_dock_open_filters",
+                    use_container_width=True,
+                    help="Scroll to sidebar filters (filters apply as you change them).",
+                )
+            with j8:
+                st.button(
+                    "Reset all",
+                    on_click=_reset_all_filters,
+                    key="main_dock_reset_all",
+                    use_container_width=True,
+                )
     n_articles_match = sum_stats["unique_articles"] if len(out) else 0
+    _sb_sub = f"from {n_articles_match:,} articles"
     st.sidebar.markdown(
         f'<div class="ave-sidebar-match">'
         f'<div class="ave-sm-label">Matching snippets</div>'
         f'<div class="ave-sm-num">{len(out):,}</div>'
-        f'<div class="ave-sm-sub">from {n_articles_match:,} articles</div>'
+        f'<div class="ave-sm-sub">{_sb_sub}</div>'
         f"</div>",
         unsafe_allow_html=True,
     )
-    sb_d1, sb_d2 = st.sidebar.columns(2)
+    sb_d1, sb_d2, sb_d3 = st.sidebar.columns(3)
     with sb_d1:
-        st.button("Filter", type="primary", on_click=_filter_open_cb, key="sb_filter", use_container_width=True)
+        st.button(
+            "⚙️ Open filters",
+            on_click=_nav_primary_cb,
+            key="sb_open_filters",
+            use_container_width=True,
+            help="Scroll to filter controls.",
+        )
     with sb_d2:
+        st.button(
+            "Apply filters",
+            type="primary",
+            on_click=_sidebar_apply_filters_cb,
+            key="sb_filter",
+            use_container_width=True,
+            help="Collapse the sidebar after reviewing filters.",
+        )
+    with sb_d3:
         st.button("Reset all", on_click=_reset_all_filters, key="sb_reset_all", use_container_width=True)
+
+    if st.session_state.pop(_SCROLL_SIDEBAR_KEY, False):
+        _sidebar_scroll_to_focus_script(st.session_state.get(_FILTER_FOCUS_KEY))
+    if st.session_state.pop(_COLLAPSE_SIDEBAR_KEY, False):
+        _collapse_sidebar_script()
+    _filter_flash_script(st.session_state.pop(DASH_FILTER_FLASH_KEY, None))
 
     # Reset page when filters change
     sig = (
@@ -1905,16 +4248,18 @@ def main() -> None:
         str(st.session_state.get("dash_d1")),
         tuple(sorted(archetypes)),
         tuple(sorted(stances)),
-        vision,
+        tuple(sorted(visions)),
         kw,
         match_all,
         pub,
         sort_by,
         page_size,
+        dedupe_paragraphs,
     )
     if st.session_state.get(_FILTER_SIG_KEY) != sig:
         st.session_state[_FILTER_SIG_KEY] = sig
         st.session_state[_PAGE_KEY] = 1
+        st.session_state.pop("ave_reprint_open_pn", None)
 
     n_snippets = len(out)
     n_articles = sum_stats["unique_articles"] if n_snippets > 0 else 0
@@ -1935,7 +4280,7 @@ def main() -> None:
             peak_month_label = str(mc.idxmax())
             peak_month_n = int(mc.max())
 
-    total = n_snippets
+    total = len(out_list)
     n_pages = max(1, (total + page_size - 1) // page_size)
     if _PAGE_KEY not in st.session_state:
         st.session_state[_PAGE_KEY] = 1
@@ -1944,14 +4289,17 @@ def main() -> None:
     st.session_state[_PAGE_KEY] = p
 
     if n_snippets == 0:
-        st.caption(f"No snippets match · {n_total:,} in the full dataset · change filters in the sidebar.")
+        st.caption(
+            f"No snippets match · {n_total:,} in the full dataset · widen filters in the **sidebar**, "
+            "or use the **menu** button in the app header if the sidebar is hidden · **Reset all** in the sidebar."
+        )
         st.markdown(
             """
 <div class="ave-empty-filter" role="status">
   <div class="ave-empty-filter-icon" aria-hidden="true">🔍</div>
   <div class="ave-empty-filter-body">
     <p class="ave-empty-filter-title">No snippets match these filters</p>
-    <p class="ave-empty-filter-hint">Widen the date range, clear keywords, or relax archetype, stance, vision, or publication in the sidebar.</p>
+    <p class="ave-empty-filter-hint">Widen the date range, clear keywords, or relax archetype, stance, vision, or publication in <strong>Filters</strong> (sidebar). If the sidebar is hidden, open it with the <strong>menu</strong> button in the app header, or use <strong>Reset all</strong> in the sidebar.</p>
   </div>
 </div>
             """,
@@ -1978,41 +4326,16 @@ def main() -> None:
             f"- **Paragraphs — fuzzy near-duplicates** (≥{_fz_thr}% similarity on normalized text; full dataset): "
             f"**{_fz_pc:,}** clusters · **{_fz_rows:,}** snippet rows in those clusters{_stale_n}\n"
         )
+    _p_dba = int(para_dup_stats.get("para_distinct_body_article_key") or 0)
     _para_exact_line = (
         "- **Paragraphs — exact duplicate text** (same normalized body on multiple rows; full dataset): "
         f"**{para_dup_stats['para_exact_extra_rows']:,}** redundant rows · "
         f"**{para_dup_stats['para_exact_multi_groups']:,}** distinct paragraph texts appearing 2+ times.\n"
+        f"- **Paragraphs × article identity** (distinct normalized body × article ID; full dataset): "
+        f"**{_p_dba:,}** — same text in another article/reprint counts as a separate unit "
+        f"(between **{para_dup_stats['para_unique_norms']:,}** unique bodies and "
+        f"**{para_dup_stats['para_rows_total']:,}** snippet rows).\n"
     )
-
-    with st.expander("Summary statistics", expanded=False):
-        st.markdown(
-            f"- **Unique articles** (distinct article ID): **{sum_stats['unique_articles']:,}**\n"
-            f"- **Article IDs with multiple title strings:** **{sum_stats['keys_multi_title']:,}** "
-            f"— same corpus ID, different normalized titles (retitling, OCR noise, or listing variants).\n"
-            f"- **Exact duplicate titles (different IDs):** **{sum_stats['titles_multi_key']:,}** "
-            f"— identical normalized title text under more than one article ID (reprint / duplicate file / split).\n"
-            f"- **Fuzzy duplicate titles (different IDs):** **{sum_stats['fuzzy_title_multi_key_groups']:,}** "
-            f"groups · **{sum_stats['fuzzy_title_keys_in_groups']:,}** article IDs involved "
-            f"(≥88% string similarity after normalizing punctuation/spacing for PDF/OCR variants).\n"
-            f"{_para_exact_line}"
-            f"{_para_fuzzy_line}"
-            f"- **Snippet rows per article ID** in this filter: "
-            f"**{sum_stats['articles_1_snippet']:,}** articles with 1 row · "
-            f"**{sum_stats['articles_2_snippets']:,}** with 2 · "
-            f"**{sum_stats['articles_3_snippets']:,}** with 3 · "
-            f"**{sum_stats['articles_4plus_snippets']:,}** with 4+ · "
-            f"max **{sum_stats['max_snippets_per_article']}** rows under one ID.\n"
-            f"- Snippets per article (mean): **{snip_per_art:.2f}**\n"
-            f"- Busiest year: **{peak_year if peak_year is not None else '—'}** ({peak_year_n:,} snippets)\n"
-            f"- Busiest month: **{peak_month_label or '—'}** ({peak_month_n:,} snippets)\n"
-            f"- Full dataset size: **{n_total:,}** snippet rows"
-        )
-        st.caption(
-            "Multiplicity and reprint counts are heuristics: there is no dedicated reprint flag in the table. "
-            "Fuzzy title groups use rapidfuzz (ratio) on normalized text; exact matches are listed separately. "
-            "Paragraph duplicate lines use the **full dataset** (not the current filter). "
-            "Fuzzy paragraph clusters are optional and CPU-heavy — precompute with `dashboard/scripts/compute_paragraph_fuzzy_dupes.py`."
-        )
 
     if len(archetypes) > 1:
         _split_field, _split_vals = "archetype", sorted(str(x) for x in archetypes)
@@ -2032,158 +4355,189 @@ def main() -> None:
     else:
         monthly_vs_rest = _monthly_filter_vs_rest_long(df_time_only, out)
 
-    with st.expander("Chart · Snippets over time", expanded=True):
-        y_mode = st.radio(
-            "Chart type",
-            ["Absolute counts (by publication)", "Filter vs rest of month (stacked)"],
-            horizontal=True,
-            key="dash_chart_y_mode",
-            help="By publication: stacked counts (split by publication, or by archetype/stance when several are "
-            "selected). Filter vs rest: each month shows all activity in your date range — compare selected "
-            "groups or see filter vs other snippets that month.",
-        )
-        if _split_field:
-            st.caption(
-                f"**Compare mode:** {_split_field.replace('_', ' ')} — each selected value has its own color "
-                "(same palette as snippet cards)."
+    with st.container(key="ave_snippet_width_stack"):
+        with st.expander("Summary statistics", expanded=False):
+            st.markdown(
+                f"- **Unique articles** (distinct article ID): **{sum_stats['unique_articles']:,}**\n"
+                f"- **Article IDs with multiple title strings:** **{sum_stats['keys_multi_title']:,}** "
+                f"— same corpus ID, different normalized titles (retitling, OCR noise, or listing variants).\n"
+                f"- **Exact duplicate titles (different IDs):** **{sum_stats['titles_multi_key']:,}** "
+                f"— identical normalized title text under more than one article ID (reprint / duplicate file / split).\n"
+                f"- **Fuzzy duplicate titles (different IDs):** **{sum_stats['fuzzy_title_multi_key_groups']:,}** "
+                f"groups · **{sum_stats['fuzzy_title_keys_in_groups']:,}** article IDs involved "
+                f"(≥88% string similarity after normalizing punctuation/spacing for PDF/OCR variants).\n"
+                f"{_para_exact_line}"
+                f"{_para_fuzzy_line}"
+                f"- **Snippet rows per article ID** in this filter: "
+                f"**{sum_stats['articles_1_snippet']:,}** articles with 1 row · "
+                f"**{sum_stats['articles_2_snippets']:,}** with 2 · "
+                f"**{sum_stats['articles_3_snippets']:,}** with 3 · "
+                f"**{sum_stats['articles_4plus_snippets']:,}** with 4+ · "
+                f"max **{sum_stats['max_snippets_per_article']}** rows under one ID.\n"
+                f"- Snippets per article (mean): **{snip_per_art:.2f}**\n"
+                f"- Busiest year: **{peak_year if peak_year is not None else '—'}** ({peak_year_n:,} snippets)\n"
+                f"- Busiest month: **{peak_month_label or '—'}** ({peak_month_n:,} snippets)\n"
+                f"- Full dataset size: **{n_total:,}** snippet rows"
             )
-        if y_mode == "Filter vs rest of month (stacked)":
-            if monthly_vs_rest.empty or monthly_vs_rest["n"].sum() == 0:
-                st.caption("No dated rows in the time window.")
-            else:
-                mvr = monthly_vs_rest.copy()
-                if _split_field:
-                    layer_order = ["Rest of month"] + list(_split_vals)
-                    color_range = ["#c5ddf0"] + [
-                        _COMPARE_COLORS[i % len(_COMPARE_COLORS)] for i in range(len(_split_vals))
-                    ]
-                else:
-                    layer_order = ["Rest of month", "This filter"]
-                    color_range = ["#c5ddf0", "#1a3d5c"]
-                vs_chart = (
-                    alt.Chart(mvr)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("ym:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
-                        y=alt.Y("n:Q", title="Snippets", stack="zero"),
-                        color=alt.Color(
-                            "layer:N",
-                            title="",
-                            sort=layer_order,
-                            scale=alt.Scale(domain=layer_order, range=color_range),
-                        ),
-                        order=alt.Order("layer_sort:Q"),
-                        tooltip=[
-                            alt.Tooltip("ym:T", title="Month"),
-                            alt.Tooltip("layer:N", title="Segment"),
-                            alt.Tooltip("n:Q", title="Snippets"),
-                        ],
-                    )
-                    .properties(height=320)
-                )
-                st.altair_chart(vs_chart, use_container_width=True)
-                if _split_field:
-                    st.caption(
-                        "Within your sidebar date range, each bar is all snippets in that month. "
-                        "Colored segments = your selected groups; bottom = other snippets in the same month."
-                    )
-                else:
-                    st.caption(
-                        "Within your sidebar date range, each bar is all snippets in that month. "
-                        "Dark segment = your current filters; light segment = other snippets in the same month."
-                    )
-        elif len(monthly_long) == 0:
-            st.caption("No dated rows in the filtered set.")
-        else:
-            ml = monthly_long.copy()
+            st.caption(
+                "Multiplicity and reprint counts are heuristics: there is no dedicated reprint flag in the table. "
+                "Fuzzy title groups use rapidfuzz (ratio) on normalized text; exact matches are listed separately. "
+                "Paragraph duplicate lines use the **full dataset** (not the current filter). "
+                "Fuzzy paragraph clusters are optional and CPU-heavy — precompute with `dashboard/scripts/compute_paragraph_fuzzy_dupes.py`."
+            )
+
+        with st.expander("Chart · Snippets over time", expanded=True):
+            y_mode = st.radio(
+                "Chart type",
+                ["Absolute counts (by publication)", "Filter vs rest of month (stacked)"],
+                horizontal=True,
+                key="dash_chart_y_mode",
+                help="By publication: stacked counts (split by publication, or by archetype/stance when several are "
+                "selected). Filter vs rest: each month shows all activity in your date range — compare selected "
+                "groups or see filter vs other snippets that month.",
+            )
             if _split_field:
-                dom = list(_split_vals)
-                clr = [_COMPARE_COLORS[i % len(_COMPARE_COLORS)] for i in range(len(dom))]
-                chart = (
-                    alt.Chart(ml)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("ym:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
-                        y=alt.Y("n:Q", title="Snippets", stack="zero"),
-                        color=alt.Color(
-                            "category:N",
-                            title=_split_field.replace("_", " ").title(),
-                            scale=alt.Scale(domain=dom, range=clr),
-                        ),
-                        tooltip=["ym:T", "category", "n"],
-                    )
-                    .properties(height=320)
-                )
-            else:
-                chart = (
-                    alt.Chart(ml)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("ym:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
-                        y=alt.Y("n:Q", title="Snippets", stack="zero"),
-                        color=alt.Color("publication:N", title="Publication"),
-                        tooltip=["ym:T", "publication", "n"],
-                    )
-                    .properties(height=320)
-                )
-            st.altair_chart(chart, use_container_width=True)
-
-    texts = out["paragraph"].fillna("").astype(str).tolist()
-    corpus_counts = _corpus_token_counter(csv_path)
-    with st.expander("Chart · Keyword word cloud (filtered snippets)", expanded=False):
-        word_prof = st.radio(
-            "Word ranking",
-            ["Distinctive vs full corpus", "Raw frequency in filter"],
-            horizontal=True,
-            key="dash_word_profile",
-            help="Distinctive: log-odds vs the whole dataset (under-represented words drop; highlights "
-            "what makes this filter different). Raw: most frequent tokens in the filter only.",
-        )
-        if word_prof.startswith("Distinctive"):
-            scores = distinctive_word_scores(texts, corpus_counts, top_n=40, min_count_filt=3)
-            wc_weights = word_weights_for_cloud_from_scores(scores) if scores else {}
-            bar_rows = scores
-            bar_x = "score"
-            bar_title = "Log-odds vs corpus (↑ = more characteristic of this filter)"
-        else:
-            wc_weights = {}
-            bar_rows = word_frequencies(texts, top_n=40)
-            bar_x = "count"
-            bar_title = "Occurrences in filtered snippets"
-
-        if word_prof.startswith("Distinctive") and not bar_rows:
-            st.caption("No distinctive terms (empty filter or too little overlap with baseline).")
-        elif not bar_rows:
-            st.caption("No token counts (empty text).")
-        else:
-            _wc_l, _wc_m, _wc_r = st.columns([1, 2.2, 1])
-            with _wc_m:
-                cloud_ok = _render_keyword_wordcloud(
-                    texts,
-                    word_weights=wc_weights if wc_weights else None,
-                )
-            if not cloud_ok:
-                wf_df = pd.DataFrame(bar_rows, columns=["word", bar_x])
-                wchart = (
-                    alt.Chart(wf_df)
-                    .mark_bar(color="#4a6b82")
-                    .encode(
-                        x=alt.X(f"{bar_x}:Q", title=bar_title),
-                        y=alt.Y("word:N", sort="-x", title=None),
-                        tooltip=["word", bar_x],
-                    )
-                    .properties(height=min(520, 14 * len(wf_df)))
-                )
-                st.altair_chart(wchart, use_container_width=True)
-                st.caption("Install `wordcloud` (see requirements.txt) for the cloud view.")
-            if word_prof.startswith("Distinctive") and bar_rows:
                 st.caption(
-                    "Distinctive terms use smoothed log-odds vs the full corpus (same token rules as raw counts). "
-                    "Positive = relatively more common in this filter than overall. "
-                    "Sort by **Most distinctive for current filter (vs full corpus)** to prioritize those words; "
-                    "by **Most representative of current filter** for excerpts closest to typical wording in the "
-                    "current filter (good paper quotes)."
+                    f"**Compare mode:** {_split_field.replace('_', ' ')} — each selected value has its own color "
+                    "(same palette as snippet cards)."
                 )
+            if y_mode == "Filter vs rest of month (stacked)":
+                if monthly_vs_rest.empty or monthly_vs_rest["n"].sum() == 0:
+                    st.caption("No dated rows in the time window.")
+                else:
+                    mvr = monthly_vs_rest.copy()
+                    if _split_field:
+                        layer_order = ["Rest of month"] + list(_split_vals)
+                        color_range = ["#c5ddf0"] + [
+                            _COMPARE_COLORS[i % len(_COMPARE_COLORS)] for i in range(len(_split_vals))
+                        ]
+                    else:
+                        layer_order = ["Rest of month", "This filter"]
+                        color_range = ["#c5ddf0", "#1a3d5c"]
+                    vs_chart = (
+                        alt.Chart(mvr)
+                        .mark_bar()
+                        .encode(
+                            x=alt.X("ym:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
+                            y=alt.Y("n:Q", title="Snippets", stack="zero"),
+                            color=alt.Color(
+                                "layer:N",
+                                title="",
+                                sort=layer_order,
+                                scale=alt.Scale(domain=layer_order, range=color_range),
+                            ),
+                            order=alt.Order("layer_sort:Q"),
+                            tooltip=[
+                                alt.Tooltip("ym:T", title="Month"),
+                                alt.Tooltip("layer:N", title="Segment"),
+                                alt.Tooltip("n:Q", title="Snippets"),
+                            ],
+                        )
+                        .properties(height=320)
+                    )
+                    st.altair_chart(vs_chart, use_container_width=True)
+                    if _split_field:
+                        st.caption(
+                            "Within your sidebar date range, each bar is all snippets in that month. "
+                            "Colored segments = your selected groups; bottom = other snippets in the same month."
+                        )
+                    else:
+                        st.caption(
+                            "Within your sidebar date range, each bar is all snippets in that month. "
+                            "Dark segment = your current filters; light segment = other snippets in the same month."
+                        )
+            elif len(monthly_long) == 0:
+                st.caption("No dated rows in the filtered set.")
+            else:
+                ml = monthly_long.copy()
+                if _split_field:
+                    dom = list(_split_vals)
+                    clr = [_COMPARE_COLORS[i % len(_COMPARE_COLORS)] for i in range(len(dom))]
+                    chart = (
+                        alt.Chart(ml)
+                        .mark_bar()
+                        .encode(
+                            x=alt.X("ym:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
+                            y=alt.Y("n:Q", title="Snippets", stack="zero"),
+                            color=alt.Color(
+                                "category:N",
+                                title=_split_field.replace("_", " ").title(),
+                                scale=alt.Scale(domain=dom, range=clr),
+                            ),
+                            tooltip=["ym:T", "category", "n"],
+                        )
+                        .properties(height=320)
+                    )
+                else:
+                    chart = (
+                        alt.Chart(ml)
+                        .mark_bar()
+                        .encode(
+                            x=alt.X("ym:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
+                            y=alt.Y("n:Q", title="Snippets", stack="zero"),
+                            color=alt.Color("publication:N", title="Publication"),
+                            tooltip=["ym:T", "publication", "n"],
+                        )
+                        .properties(height=320)
+                    )
+                st.altair_chart(chart, use_container_width=True)
+
+        texts = out["paragraph"].fillna("").astype(str).tolist()
+        corpus_counts = _corpus_token_counter(csv_path)
+        with st.expander("Chart · Keyword word cloud (filtered snippets)", expanded=False):
+            word_prof = st.radio(
+                "Word ranking",
+                ["Distinctive vs full corpus", "Raw frequency in filter"],
+                horizontal=True,
+                key="dash_word_profile",
+                help="Distinctive: log-odds vs the whole dataset (under-represented words drop; highlights "
+                "what makes this filter different). Raw: most frequent tokens in the filter only.",
+            )
+            if word_prof.startswith("Distinctive"):
+                scores = distinctive_word_scores(texts, corpus_counts, top_n=40, min_count_filt=3)
+                wc_weights = word_weights_for_cloud_from_scores(scores) if scores else {}
+                bar_rows = scores
+                bar_x = "score"
+                bar_title = "Log-odds vs corpus (↑ = more characteristic of this filter)"
+            else:
+                wc_weights = {}
+                bar_rows = word_frequencies(texts, top_n=40)
+                bar_x = "count"
+                bar_title = "Occurrences in filtered snippets"
+
+            if word_prof.startswith("Distinctive") and not bar_rows:
+                st.caption("No distinctive terms (empty filter or too little overlap with baseline).")
+            elif not bar_rows:
+                st.caption("No token counts (empty text).")
+            else:
+                _wc_l, _wc_m, _wc_r = st.columns([1, 2.2, 1])
+                with _wc_m:
+                    cloud_ok = _render_keyword_wordcloud(
+                        texts,
+                        word_weights=wc_weights if wc_weights else None,
+                    )
+                if not cloud_ok:
+                    wf_df = pd.DataFrame(bar_rows, columns=["word", bar_x])
+                    wchart = (
+                        alt.Chart(wf_df)
+                        .mark_bar(color="#4a6b82")
+                        .encode(
+                            x=alt.X(f"{bar_x}:Q", title=bar_title),
+                            y=alt.Y("word:N", sort="-x", title=None),
+                            tooltip=["word", bar_x],
+                        )
+                        .properties(height=min(520, 14 * len(wf_df)))
+                    )
+                    st.altair_chart(wchart, use_container_width=True)
+                    st.caption("Install `wordcloud` (see requirements.txt) for the cloud view.")
+                if word_prof.startswith("Distinctive") and bar_rows:
+                    st.caption(
+                        "Distinctive terms use smoothed log-odds vs the full corpus (same token rules as raw counts). "
+                        "Positive = relatively more common in this filter than overall. "
+                        "Sort by **Most distinctive for current filter (vs full corpus)** to prioritize those words; "
+                        "by **Most representative of current filter** for excerpts closest to typical wording in the "
+                        "current filter (good paper quotes)."
+                    )
 
     # Snippet controls: in normal document flow above the list; same row pins under the app header
     # after scrolling past #ave-snippet-toolbar-sentinel (see _fixed_nav_scroll_script).
@@ -2191,10 +4545,21 @@ def main() -> None:
         '<div id="ave-snippet-toolbar-sentinel" style="height:1px;width:100%;margin:0;padding:0" aria-hidden="true"></div>',
         unsafe_allow_html=True,
     )
-    _nav_stats_html = (
-        f"<div class='ave-nav-toolbar-stats'><strong>{n_snippets:,}</strong> snippets · "
-        f"<strong>{total:,}</strong> in filter</div>"
-    )
+    if dedupe_paragraphs and n_snippets > 0 and total < n_snippets:
+        _nav_stats_html = (
+            "<div class='ave-nav-toolbar-stats' title='List = distinct paragraph bodies (normalized). See Corpus & counts at bottom.'>"
+            f"<strong>{total:,}</strong> in list · <strong>{n_snippets:,}</strong> rows in filter</div>"
+        )
+    elif dedupe_paragraphs and n_snippets > 0:
+        _nav_stats_html = (
+            "<div class='ave-nav-toolbar-stats'>"
+            f"<strong>{total:,}</strong> in list · <strong>{n_snippets:,}</strong> rows</div>"
+        )
+    else:
+        _nav_stats_html = (
+            f"<div class='ave-nav-toolbar-stats'><strong>{n_snippets:,}</strong> snippets · "
+            f"<strong>{total:,}</strong> in list</div>"
+        )
     _nav_page_html = (
         f"<div class='ave-nav-toolbar-page'>Page <strong>{p}</strong> of <strong>{n_pages}</strong></div>"
     )
@@ -2210,41 +4575,79 @@ def main() -> None:
         f"{_nav_stats_html}"
         "</div>"
     )
-    nv1, nv2, nv3, nv4 = st.columns([1.55, 0.82, 1.28, 2.35])
+    # Counts · pager · compact "List options" popover (per-page + sort stay available without crowding small screens)
+    nv1, nv2, nv3 = st.columns([1.45, 2.5, 1.05])
     with nv1:
         st.markdown(_nav_row1_html, unsafe_allow_html=True)
     with nv2:
-        st.selectbox(
-            "Per page",
-            [25, 50, 100, 200],
-            key="dash_page_size",
-            help="How many snippet cards to show on each page (does not change your filter).",
-        )
-    with nv3:
-        st.selectbox(
-            "Order by",
-            SORT_SNIPPET_OPTIONS,
-            key="dash_sort",
-            help=(
-                "How snippets are ordered within the current filter. "
-                "Distinctive: log-odds for the current filter vs the full corpus. "
-                "Representative: closest to typical wording within the current filter."
-            ),
-        )
-    with nv4:
         pc1, pc2, pc3, pc4 = st.columns([0.95, 1.05, 0.95, 0.55])
         with pc1:
-            if st.button("Previous", disabled=p <= 1, key="nav_prev", use_container_width=True):
+            if st.button("Previous", disabled=p <= 1, key="nav_prev", use_container_width=False):
                 st.session_state[_PAGE_KEY] = p - 1
+                st.session_state.pop("ave_reprint_open_pn", None)
                 st.rerun()
         with pc2:
             st.markdown(_nav_page_html, unsafe_allow_html=True)
         with pc3:
-            if st.button("Next", disabled=p >= n_pages, key="nav_next", use_container_width=True):
+            if st.button("Next", disabled=p >= n_pages, key="nav_next", use_container_width=False):
                 st.session_state[_PAGE_KEY] = p + 1
+                st.session_state.pop("ave_reprint_open_pn", None)
                 st.rerun()
         with pc4:
             st.markdown(_nav_top_html, unsafe_allow_html=True)
+    with nv3:
+        # Minimal ``st.popover`` API — extra kwargs (width, icon) can break older Streamlit builds.
+        _popover = getattr(st, "popover", None)
+        if _popover is not None:
+            _list_opts_ctx = _popover("List options", key="dash_snippet_nav_popover")
+        else:
+            _list_opts_ctx = st.expander("List options", expanded=False)
+        with _list_opts_ctx:
+            st.selectbox(
+                "Per page",
+                [25, 50, 100, 200],
+                key="dash_page_size",
+                help="How many snippet cards to show on each page (does not change your filter).",
+            )
+            st.selectbox(
+                "Order by",
+                SORT_SNIPPET_OPTIONS,
+                key="dash_sort",
+                help=(
+                    "How snippets are ordered within the current filter. "
+                    "Distinctive: log-odds for the current filter vs the full corpus. "
+                    "Representative: closest to typical wording within the current filter. "
+                    "See **Explanations** for more."
+                ),
+            )
+            st.checkbox(
+                "Merge identical paragraph text (reprints)",
+                key="dash_dedupe_paragraphs",
+                help=(
+                    "Each distinct paragraph body is shown once. Multiplicity uses a stacked card and ×N; "
+                    "click **×N** to open a table of every matching row in this filter."
+                ),
+            )
+            st.divider()
+            _pf1, _pf2 = st.columns(2)
+            with _pf1:
+                if st.button(
+                    "Clear filters",
+                    key="dash_popover_clear_filters",
+                    use_container_width=True,
+                    help="Reset all filters to defaults (same as Reset all in the sidebar).",
+                ):
+                    _reset_all_filters()
+                    st.rerun()
+            with _pf2:
+                if st.button(
+                    "Adjust filters",
+                    key="dash_popover_adjust_filters",
+                    use_container_width=True,
+                    help="Scroll to filters in the sidebar (same as the chip dock).",
+                ):
+                    _nav_primary_cb()
+                    st.rerun()
 
     st.markdown(
         '<div id="ave-nav-flow-spacer" class="ave-nav-flow-spacer" aria-hidden="true"></div>',
@@ -2255,33 +4658,84 @@ def main() -> None:
 
     # ----- Snippet list + table -----
     start = (p - 1) * page_size
-    chunk = out.iloc[start : start + page_size]
+    chunk = out_list.iloc[start : start + page_size]
 
-    st.markdown(
-        '<p style="margin:0 0 0.65rem 0;padding:0;font-size:0.95rem;font-weight:600;color:#2d3436">Snippets</p>',
-        unsafe_allow_html=True,
-    )
+    st.subheader("Snippets")
 
-    _pad_l, snippet_mid, _pad_r = st.columns([1, 14, 1])
-    with snippet_mid:
-        rows_list = list(chunk.iterrows())
-        _arch_l, _stance_l = list(archetypes), list(stances)
+    rows_list = list(chunk.iterrows())
+    _arch_l, _stance_l, _vis_l = list(archetypes), list(stances), list(visions)
+    if dedupe_paragraphs:
+        _lookup = {i: str(row["_ave_para_norm"]) for i, (_, row) in enumerate(rows_list)}
+        _nrows = len(rows_list)
+        # Two Streamlit columns of snippet rows; ×N is a real button beside the index (opens st.dialog).
+        for i in range(0, _nrows, 2):
+            try:
+                c1, c2 = st.columns(2, gap="large")
+            except TypeError:
+                c1, c2 = st.columns(2)
+            with c1:
+                _, row = rows_list[i]
+                _render_snippet_row_streamlit(
+                    row,
+                    global_index=start + i + 1,
+                    reprint_button_key=f"ave_reprint_badge_{p}_{start}_{i}",
+                    archetypes=_arch_l,
+                    stances=_stance_l,
+                    visions=_vis_l,
+                    para_norm=_lookup[i],
+                )
+            if i + 1 < _nrows:
+                with c2:
+                    _, row = rows_list[i + 1]
+                    _render_snippet_row_streamlit(
+                        row,
+                        global_index=start + i + 2,
+                        reprint_button_key=f"ave_reprint_badge_{p}_{start}_{i + 1}",
+                        archetypes=_arch_l,
+                        stances=_stance_l,
+                        visions=_vis_l,
+                        para_norm=_lookup[i + 1],
+                    )
+            if i + 2 < _nrows:
+                st.markdown(
+                    '<div class="ave-snippet-dedupe-pair-spacer" aria-hidden="true"></div>',
+                    unsafe_allow_html=True,
+                )
+    else:
         _cells = [
             _snippet_item_html(
                 row,
                 global_index=start + i + 1,
                 archetypes=_arch_l,
                 stances=_stance_l,
+                visions=_vis_l,
+                reprint_count=max(1, int(row.get("reprint_count", 1))),
             )
             for i, (_, row) in enumerate(rows_list)
         ]
-        st.markdown(
-            '<div id="ave-snippet-grid" class="ave-snippet-grid">' + "".join(_cells) + "</div>",
-            unsafe_allow_html=True,
+        _render_snippet_block(
+            '<div id="ave-snippet-grid" class="ave-snippet-grid ave-snippet-grid-root">'
+            + "".join(_cells)
+            + "</div>"
         )
 
+    _pn_open = st.session_state.get("ave_reprint_open_pn")
+    if _pn_open is not None and out_full is not None and dedupe_paragraphs:
+
+        @st.dialog("Reprints — all appearances in this filter")
+        def _ave_reprint_dialog() -> None:
+            show = _reprint_occurrences_dataframe(str(_pn_open), out_full)
+            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.caption(f"{len(show)} row(s) in this filter share this paragraph text (normalized).")
+            if st.button("Close", key="ave_reprint_dlg_close"):
+                st.session_state.pop("ave_reprint_open_pn", None)
+                st.rerun()
+
+        _ave_reprint_dialog()
+
+    _cap_tail = f" · {n_snippets:,} snippet rows in filter" if (dedupe_paragraphs and total < n_snippets) else ""
     st.caption(
-        f"Showing snippets {start + 1}–{min(start + page_size, total)} of {total:,}"
+        f"Showing items {start + 1}–{min(start + page_size, total)} of {total:,}{_cap_tail}"
     )
 
     # Tabular view + download (bottom)
@@ -2295,6 +4749,8 @@ def main() -> None:
         "paragraph",
     ]
     chunk_show = chunk[[c for c in display_cols if c in chunk.columns]].copy()
+    if dedupe_paragraphs and "reprint_count" in chunk.columns:
+        chunk_show.insert(0, "reprint_count", chunk["reprint_count"])
     if "date" in chunk_show.columns:
         chunk_show["date"] = pd.to_datetime(chunk_show["date"], errors="coerce").dt.strftime("%Y-%m-%d")
 
@@ -2309,6 +4765,42 @@ def main() -> None:
         file_name=f"snippets_page{p}.csv",
         mime="text/csv",
     )
+
+    with st.expander("Corpus & how counts are built", expanded=False):
+        st.markdown(
+            "**How the corpus was produced.** Rows come from your merged analysis table: each row is one "
+            "paragraph (snippet) that was classified for future vision, stance, and archetype. Dates and "
+            "publication are attached for filtering; the same paragraph text can appear more than once when "
+            "articles are reprinted or duplicated in the source files — we **do not** drop those rows by default "
+            "(they carry separate dates and article IDs). **List options → Merge identical paragraph text** "
+            "collapses identical normalized text in the card list so you read each wording once; the table "
+            "below still reflects the current page of that list."
+        )
+        if dedupe_paragraphs and n_match > 0:
+            _nu = len(out_list)
+            st.markdown(
+                f"- **Distinct paragraph bodies in this filter** (normalized text): **{_nu:,}**  \n"
+                f"- **Snippet rows in this filter** (all matching rows): **{n_match:,}**  \n"
+                f"- **Full loaded corpus** (snippet rows): **{n_total:,}**  \n"
+                f"- **Articles** represented in this filter: **{n_art_match:,}**  \n"
+                f"- **Share of corpus** in this filter: **{pct_corpus:.1f}%**  \n"
+                f"- **Snippets per article** (mean in this filter): **{snip_per_article_line:.2f}**"
+            )
+        else:
+            st.markdown(
+                f"- **Snippet rows in this filter:** **{n_match:,}** / **{n_total:,}** in full corpus  \n"
+                f"- **Articles** in this filter: **{n_art_match:,}** · **{pct_corpus:.1f}%** of corpus  \n"
+                f"- **Snippets per article:** **{snip_per_article_line:.2f}**"
+            )
+        _pdba = int(para_dup_stats.get("para_distinct_body_article_key") or 0)
+        st.markdown(
+            "**Full dataset (not filter-specific).** "
+            f"**{para_dup_stats['para_rows_total']:,}** snippet rows · "
+            f"**{para_dup_stats['para_unique_norms']:,}** distinct normalized paragraph bodies · "
+            f"**{_pdba:,}** distinct (body × article ID) pairs "
+            "(same wording in another article counts separately). "
+            "See **Summary statistics** above for reprint heuristics and optional fuzzy duplicate clusters."
+        )
 
     st.caption(f"Data file: `{csv_path}`")
 

@@ -61,6 +61,7 @@ def main() -> None:
     exact = paragraph_exact_duplicate_metrics(df)
     print(
         f"Exact: {exact['para_rows_total']:,} rows · {exact['para_unique_norms']:,} unique norms · "
+        f"{exact['para_distinct_body_article_key']:,} distinct (body × article) · "
         f"{exact['para_exact_extra_rows']:,} extra duplicate rows · {exact['para_exact_multi_groups']:,} multi-row texts"
     )
 

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none" aria-hidden="true">
+  <!-- Static geometry; motion is applied via dashboard CSS (hover / loading only). -->
+  <g class="ave-ring-group">
+    <g class="ave-ring-parasite">
+      <circle cx="72" cy="50" r="16" stroke="#0047E1" stroke-width="5.5" stroke-linecap="round"/>
+    </g>
+    <g class="ave-ring-mediator">
+      <circle cx="50" cy="50" r="16" stroke="#D4B475" stroke-width="5.5" stroke-linecap="round"/>
+    </g>
+    <g class="ave-ring-palisade">
+      <circle cx="28" cy="50" r="16" stroke="#8DA389" stroke-width="5.5" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>
