@@ -410,12 +410,18 @@ def _explorer_title_bar_html(icon_uri: str) -> str:
 
 
 def _explorer_title_bar_row_html(icon_uri: str) -> str:
-    """One flex row: title strip + **Explanations** (``?guide=1`` — same as legacy guide URLs; avoids Streamlit column wrap bugs)."""
+    """One flex row: title strip + **Explanations** button (JS clicks hidden Streamlit button; avoids page navigation which resets session/auth)."""
     strip = _explorer_title_bar_html(icon_uri)
+    # onclick: prevent navigation; click the hidden trigger button in the same document.
+    _onclick = (
+        "event.preventDefault();"
+        "(function(){var b=document.querySelector('[class*=st-key-ave_open_guide] button');"
+        "if(b)b.click();}())"
+    )
     return (
         f'<div class="ave-expl-title-unified">'
         f'<div class="ave-expl-title-unified__left">{strip}</div>'
-        f'<a class="ave-expl-title-unified__link" href="?guide=1" aria-label="Open Explanations">Explanations</a>'
+        f'<a class="ave-expl-title-unified__link" href="#" role="button" onclick="{_onclick}" aria-label="Open Explanations">Explanations</a>'
         f"</div>"
     )
 
@@ -797,9 +803,9 @@ def _render_snippet_row_streamlit(
 ) -> None:
     """One snippet row: index + optional ×N ``st.button`` + card via ``st.html`` (dedupe / reprints)."""
     _rc = max(1, int(row.get("reprint_count", 1)))
-    # Narrow index rail + wide card; gap separates index from card.
+    # Narrow index rail + wide card; small gap keeps number close to card.
     try:
-        idx_col, card_col = st.columns([1, 14], gap="large")
+        idx_col, card_col = st.columns([1, 14], gap="small")
     except TypeError:
         idx_col, card_col = st.columns([1, 14])
     with idx_col:
@@ -1746,6 +1752,16 @@ def _inject_branding_css() -> None:
     background: rgba(255, 255, 255, 0.28) !important;
     border-color: rgba(255, 255, 255, 0.92) !important;
     color: #ffffff !important;
+  }
+  /* Hidden guide trigger button — JS-clicked only, visually invisible. */
+  [data-testid="stMain"] [class*="st-key-ave_open_guide"] {
+    position: absolute !important;
+    left: -9999px !important;
+    top: -9999px !important;
+    width: 0 !important;
+    height: 0 !important;
+    overflow: hidden !important;
+    pointer-events: none !important;
   }
   @media (max-width: 560px) {
     .ave-expl-title-unified {
@@ -4128,7 +4144,11 @@ def main() -> None:
             out_list = out
             out_full = None
 
-    # Title + Explanations: one HTML flex row (`?guide=1` opens Explanations — see guide query handler above).
+    # Hidden trigger button — JS in the Explanations link clicks this to open guide without page navigation.
+    if st.button("", key="ave_open_guide"):
+        st.session_state[AVE_SHOW_GUIDE_KEY] = True
+        st.rerun()
+    # Title + Explanations: one HTML flex row (onclick JS clicks hidden button above; avoids session-resetting navigation).
     st.markdown(_explorer_title_bar_row_html(_icon_uri), unsafe_allow_html=True)
 
     st.markdown('<div id="ave-top" style="height:1px;margin:0;padding:0;"></div>', unsafe_allow_html=True)
