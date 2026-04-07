@@ -18,6 +18,24 @@ import textwrap
 
 import streamlit as st
 
+
+def _build_label() -> str:
+    # Helpful for confirming production is running expected code.
+    # Streamlit Cloud typically checks out a git repo so `git rev-parse` often works, but don't rely on it.
+    try:
+        import subprocess
+
+        sha = (
+            subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL)
+            .decode("utf-8")
+            .strip()
+        )
+        if sha:
+            return f"build {sha}"
+    except Exception:
+        pass
+    return ""
+
 try:
     import matplotlib.pyplot as plt
 except ModuleNotFoundError as _e:
@@ -4925,7 +4943,11 @@ def main() -> None:
             unsafe_allow_html=True,
         )
         _guide_back_row_script()
-        mode = str(st.session_state.get("ave_guide_mode") or "main")
+        # Robust routing: if the explicit guide mode is missing, infer from the last dashboard view.
+        mode_raw = st.session_state.get("ave_guide_mode")
+        if not mode_raw:
+            mode_raw = "loops" if str(st.session_state.get("ave_page") or "") == "Loop pairs" else "main"
+        mode = str(mode_raw)
         if mode == "loops":
             _render_loops_guide_page()
         else:
@@ -5040,6 +5062,7 @@ def main() -> None:
     <div>
       <p class="sb-title">AI Vision Explorer</p>
       <p class="sb-sub">HBR · MIT SMR</p>
+      {f'<p class="sb-sub" style="margin-top:0.05rem;color:#94a3b8;">{html.escape(_build_label())}</p>' if _build_label() else ''}
       <p class="sb-guide-hint sb-guide-hint-full">Concepts &amp; categories: open <strong>Explanations</strong> (top right, next to the title).</p>
       <p class="sb-guide-hint sb-guide-hint-short">Use <strong>Explanations</strong> (top right) for concepts &amp; categories.</p>
     </div>
