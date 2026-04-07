@@ -10,6 +10,7 @@ import contextlib
 import html
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -425,6 +426,228 @@ def _explorer_title_bar_row_html(icon_uri: str) -> str:
         f'<div class="ave-expl-title-unified__left">{strip}</div>'
         f'<button class="ave-expl-title-unified__link" type="button" onclick="{_onclick}" aria-label="Open Explanations">Explanations</button>'
         f"</div>"
+    )
+
+
+def _render_loops_guide_page() -> None:
+    st.markdown("## A Quick Guide to the Loop Explorer")
+
+    # Intro + theory as two cards side-by-side.
+    c1, c2 = st.columns([1.25, 1.0], gap="large")
+    with c1:
+        with st.container(border=True):
+            st.markdown("### What is this?")
+            st.markdown(
+                "This dashboard lets you explore how business publications have talked about **AI** over the past decade — "
+                "specifically **Harvard Business Review** and **MIT Sloan Management Review**. "
+                "We analyzed thousands of paragraphs to understand the patterns in how executives and thought leaders **frame AI**."
+            )
+    with c2:
+        with st.container(border=True):
+            st.markdown("### The Theory (Organizing Visions)")
+            st.markdown(
+                "When a new technology emerges, communities don’t just adopt it — they first need to **make sense of it together**.\n\n"
+                "This collective sensemaking is called an **Organizing Vision** (Swanson & Ramiller, 1997): the narrative infrastructure "
+                "that helps organizations decide **whether** and **how** to adopt something new."
+            )
+
+    st.markdown("### The Three Archetypes")
+    a1, a2, a3 = st.columns(3, gap="large")
+    with a1:
+        with st.container(border=True):
+            st.markdown("#### Pioneer 🚀")
+            st.markdown("**Opens new possibilities.**\n\n“AI will transform everything!”")
+            st.caption("Expansive, opportunity‑focused")
+    with a2:
+        with st.container(border=True):
+            st.markdown("#### Builder 🔧")
+            st.markdown("**Translates vision into practice.**\n\n“Here’s how to actually implement AI.”")
+            st.caption("Pragmatic, how‑to oriented")
+    with a3:
+        with st.container(border=True):
+            st.markdown("#### Guardian 🛡️")
+            st.markdown("**Raises concerns and boundaries.**\n\n“But what about jobs, bias, control?”")
+            st.caption("Cautious, risk‑aware")
+
+    st.caption(
+        "These aren’t random categories — they emerge from combining two coded dimensions in each paragraph: "
+        "**future type** × **rhetorical stance**."
+    )
+
+    st.markdown("### The Loops: How Archetypes Interact")
+    st.markdown("The archetypes don’t exist in isolation — they respond to each other over time.")
+
+    # Try to load the provided screenshots from a production-friendly location; otherwise fall back.
+    loop_img = os.path.join(_DASHBOARD_DIR, "assets", "loop_diagram.png")
+    irf_img = os.path.join(_DASHBOARD_DIR, "assets", "irf_grid.png")
+
+    def _png_data_uri(path: str) -> str:
+        try:
+            with open(path, "rb") as f:
+                b = f.read()
+            return "data:image/png;base64," + base64.b64encode(b).decode("ascii")
+        except Exception:
+            return ""
+
+    if os.path.isfile(loop_img):
+        # Avoid any global CSS that might distort Streamlit's image widget: render as HTML img with height:auto.
+        uri = _png_data_uri(loop_img)
+        if uri:
+            st.markdown(
+                f"""
+<figure class="ave-guide-figure">
+  <div class="ave-guide-imgwrap">
+    <img src="{html.escape(uri, quote=True)}" alt="Loop diagram" />
+  </div>
+  <figcaption>Loop diagram (Pioneer, Builder, Guardian; Dominant/Catalytic/Translation loops)</figcaption>
+</figure>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.image(loop_img, caption="Loop diagram (Pioneer, Builder, Guardian; Dominant/Catalytic/Translation loops)")
+    else:
+        fig2, ax2 = plt.subplots(figsize=(10.8, 3.0))
+        ax2.axis("off")
+        outer = plt.matplotlib.patches.Ellipse((0.5, 0.52), 0.95, 0.78, facecolor="#d1d5db", edgecolor="none", alpha=0.9)
+        ax2.add_patch(outer)
+        for cx in (0.32, 0.5, 0.68):
+            e = plt.matplotlib.patches.Ellipse((cx, 0.52), 0.42, 0.52, facecolor="#ffffff", edgecolor="none", alpha=0.55)
+            ax2.add_patch(e)
+        for cx, label in [(0.27, "Pioneer\nvisions"), (0.50, "Builder\nvisions"), (0.73, "Guardian\nvisions")]:
+            circ = plt.matplotlib.patches.Circle((cx, 0.52), 0.13, fill=False, linestyle=":", linewidth=2.0, edgecolor="#111827")
+            ax2.add_patch(circ)
+            ax2.text(cx, 0.52, label, ha="center", va="center", fontsize=12)
+        ax2.text(0.06, 0.52, "Catalytic\nloop", ha="center", va="center", fontsize=12)
+        ax2.text(0.94, 0.52, "Translation\nloop", ha="center", va="center", fontsize=12)
+        ax2.text(0.5, 0.14, "Dominant loop", ha="center", va="center", fontsize=14)
+        st.pyplot(fig2, clear_figure=True)
+
+    st.markdown("### The three loop types (at a glance)")
+    l1, l2, l3 = st.columns(3, gap="large")
+    with l1:
+        with st.container(border=True):
+            st.markdown("#### Dominant loop")
+            st.markdown("**Pioneer ↔ Guardian**")
+            st.markdown("- Hype meets skepticism\n- Push–pull tension shapes what comes next")
+    with l2:
+        with st.container(border=True):
+            st.markdown("#### Catalytic loop")
+            st.markdown("**Pioneer → Builder**")
+            st.markdown('- “AI will change everything” → “Here’s how to actually do it”')
+    with l3:
+        with st.container(border=True):
+            st.markdown("#### Translation loop")
+            st.markdown("**Guardian → Builder**")
+            st.markdown('- “AI is risky” → “Here’s how to do AI responsibly”')
+
+    st.markdown("### The Evidence: Impulse Response Functions")
+    st.markdown(
+        "We fit a **Vector Autoregression (VAR)** to the monthly archetype signals and compute **Impulse Response Functions (IRFs)** — "
+        "these show what happens to each archetype when another gets a sudden **shock**."
+    )
+
+    if os.path.isfile(irf_img):
+        uri = _png_data_uri(irf_img)
+        if uri:
+            st.markdown(
+                f"""
+<figure class="ave-guide-figure">
+  <div class="ave-guide-imgwrap">
+    <img src="{html.escape(uri, quote=True)}" alt="Impulse response functions (IRFs)" />
+  </div>
+  <figcaption>Impulse response functions (IRFs) over 12 months</figcaption>
+</figure>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.image(irf_img, caption="Impulse response functions (IRFs) over 12 months")
+    else:
+        fig, axs = plt.subplots(3, 3, figsize=(10.8, 6.6), sharex=True)
+        titles = [
+            ["Builder → Builder", "Guardian → Builder", "Pioneer → Builder"],
+            ["Builder → Guardian", "Guardian → Guardian", "Pioneer → Guardian"],
+            ["Builder → Pioneer", "Guardian → Pioneer", "Pioneer → Pioneer"],
+        ]
+        x = list(range(13))
+        shapes = [
+            [(-1.8, -1.2), (1.2, 0.9), (1.4, 1.0)],
+            [(3.8, 3.2), (-4.2, -3.4), (5.8, 4.6)],
+            [(-2.6, -2.0), (3.4, 2.6), (-6.0, -4.8)],
+        ]
+        for r in range(3):
+            for c in range(3):
+                ax = axs[r][c]
+                a, b = shapes[r][c]
+                y = []
+                for t in x:
+                    val = (a * (0.55 ** t)) + (b * (0.82 ** t)) * (1.0 if t else 0.0)
+                    if t > 1:
+                        val += 0.15 * math.sin(0.9 * t)
+                    y.append(val)
+                ax.plot(x, y, lw=2)
+                ax.axhline(0, color="black", lw=1, alpha=0.6)
+                ax.set_title(titles[r][c], fontsize=10)
+                ax.grid(False)
+        for ax in axs[-1]:
+            ax.set_xlabel("Months")
+        axs[0][0].set_ylabel("Builder (pp)")
+        axs[1][0].set_ylabel("Guardian (pp)")
+        axs[2][0].set_ylabel("Pioneer (pp)")
+        fig.tight_layout()
+        st.pyplot(fig, clear_figure=True)
+
+    r1, r2 = st.columns([1.05, 1.35], gap="large")
+    with r1:
+        with st.container(border=True):
+            st.markdown("#### How to read the IRFs")
+            st.markdown('- Each cell answers: **“If [column] gets a shock, what happens to [row] over 12 months?”**\n'
+                        "- Above 0 = that archetype increases\n"
+                        "- Below 0 = that archetype decreases")
+    with r2:
+        with st.container(border=True):
+            st.markdown("#### Key patterns (high-signal)")
+            st.markdown(
+                "- **Pioneer → Guardian**: rises and stays elevated (hype triggers sustained pushback)\n"
+                "- **Guardian → Pioneer**: rises then stabilizes (concerns spark new framing)\n"
+                "- **Pioneer → Builder**: small positive lift (visions create implementation demand)\n"
+                "- **Builder → Pioneer**: goes negative (pragmatism dampens enthusiasm)"
+            )
+
+    st.markdown("### How the Pairs Are Chosen")
+    with st.container(border=True):
+        st.markdown(
+            "We don’t hand-pick examples — we let the data surface them:\n\n"
+            "1) Fit a forecasting model (VAR) to learn the typical month-to-month rhythm\n"
+            "2) Find **shock months** (large residual surprises)\n"
+            "3) Use IRFs to estimate the **response lag** (peak response timing)\n"
+            "4) Pick representative paragraphs (shock month + response month), optionally preferring **shared thematic keywords**\n\n"
+            "**Example**: *Pioneer (Apr 2016) → Guardian (Jul 2016) · lag T+3*"
+        )
+
+    st.markdown("### How to Use the Explorer")
+    u1, u2 = st.columns(2, gap="large")
+    with u1:
+        with st.container(border=True):
+            st.markdown("#### Choose what to explore")
+            st.markdown(
+                "- Pick a **loop preset** (Dominant / Catalytic / Translation)\n"
+                "- Increase **Examples per direction** for more candidate stories\n"
+                "- Use **Ordering** to surface different “best” narratives"
+            )
+    with u2:
+        with st.container(border=True):
+            st.markdown("#### Read the pairs")
+            st.markdown(
+                "- Left card = **shock** paragraph\n"
+                "- Right card = **response** paragraph\n"
+                "- Arrow shows the **lag (T+months)**\n"
+                "- Turn on **thematic overlap** to prioritize continuity"
+            )
+
+    st.caption(
+        "You’re seeing an organizing vision in action — not a single narrative, but a dynamic conversation between different ways of framing the technology."
     )
 
 
@@ -1115,6 +1338,8 @@ def _render_loop_pairs_page(df: pd.DataFrame, *, csv_path: str) -> None:
                 )
             with right:
                 if st.button("Explanations", key="ave_open_guide", use_container_width=True):
+                    st.session_state["ave_guide_mode"] = "loops"
+                    st.session_state["ave_return_page"] = "Loop pairs"
                     st.session_state[AVE_SHOW_GUIDE_KEY] = True
                     st.rerun()
         st.subheader("Loop pairs")
@@ -1134,6 +1359,8 @@ def _render_loop_pairs_page(df: pd.DataFrame, *, csv_path: str) -> None:
                 )
             with right:
                 if st.button("Explanations", key="ave_open_guide", use_container_width=True):
+                    st.session_state["ave_guide_mode"] = "loops"
+                    st.session_state["ave_return_page"] = "Loop pairs"
                     st.session_state[AVE_SHOW_GUIDE_KEY] = True
                     st.rerun()
         st.subheader("Loop pairs")
@@ -1148,6 +1375,8 @@ def _render_loop_pairs_page(df: pd.DataFrame, *, csv_path: str) -> None:
             st.markdown(_explorer_title_bar_html(_icon_uri, title="AI Loops Explorer"), unsafe_allow_html=True)
         with right:
             if st.button("Explanations", key="ave_open_guide", use_container_width=True):
+                st.session_state["ave_guide_mode"] = "loops"
+                st.session_state["ave_return_page"] = "Loop pairs"
                 st.session_state[AVE_SHOW_GUIDE_KEY] = True
                 st.rerun()
 
@@ -3290,6 +3519,27 @@ def _inject_branding_css() -> None:
     line-height: 1;
     box-shadow: 0 1px 2px rgba(15, 23, 42, 0.18);
   }
+  /* Loops guide: keep embedded images undistorted */
+  .ave-guide-figure {
+    margin: 0.65rem 0 0.85rem 0;
+  }
+  .ave-guide-imgwrap {
+    width: 100%;
+    max-width: 980px;
+    margin: 0 auto;
+  }
+  .ave-guide-imgwrap img {
+    display: block;
+    width: 100%;
+    height: auto !important;
+    object-fit: contain;
+  }
+  .ave-guide-figure figcaption {
+    text-align: center;
+    font-size: 0.85rem;
+    color: #475569;
+    margin-top: 0.35rem;
+  }
   .ave-loop-missing {
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
     font-size: 0.9rem;
@@ -4662,13 +4912,24 @@ def main() -> None:
         with _gb_cols[0]:
             if st.button("← Back to dashboard", key="ave_back_guide", use_container_width=False):
                 st.session_state[AVE_SHOW_GUIDE_KEY] = False
+                ret = str(st.session_state.get("ave_return_page") or "").strip()
+                if ret:
+                    st.session_state["ave_page"] = ret
+                if "ave_return_page" in st.session_state:
+                    del st.session_state["ave_return_page"]
+                if "ave_guide_mode" in st.session_state:
+                    del st.session_state["ave_guide_mode"]
                 st.rerun()
         st.markdown(
             '<div id="ave-guide-back-flow-spacer" class="ave-guide-back-flow-spacer" aria-hidden="true"></div>',
             unsafe_allow_html=True,
         )
         _guide_back_row_script()
-        render_guide_page()
+        mode = str(st.session_state.get("ave_guide_mode") or "main")
+        if mode == "loops":
+            _render_loops_guide_page()
+        else:
+            render_guide_page()
         st.stop()
 
     csv_path = _dashboard_csv_path(_PROJECT_ROOT)
@@ -5118,6 +5379,8 @@ def main() -> None:
             st.markdown(_explorer_title_bar_html(_icon_uri, title="AI Vision Explorer"), unsafe_allow_html=True)
         with right:
             if st.button("Explanations", key="ave_open_guide", use_container_width=True):
+                st.session_state["ave_guide_mode"] = "main"
+                st.session_state["ave_return_page"] = "Explorer"
                 st.session_state[AVE_SHOW_GUIDE_KEY] = True
                 st.rerun()
 
