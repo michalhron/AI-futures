@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import textwrap
 
 import streamlit as st
 
@@ -51,6 +52,7 @@ except ModuleNotFoundError as _e:
     raise
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit.components.v1 as components
 
@@ -412,16 +414,16 @@ def _explorer_title_bar_html(icon_uri: str) -> str:
 def _explorer_title_bar_row_html(icon_uri: str) -> str:
     """One flex row: title strip + **Explanations** button (JS clicks hidden Streamlit button; avoids page navigation which resets session/auth)."""
     strip = _explorer_title_bar_html(icon_uri)
-    # onclick: prevent navigation; click the hidden trigger button in the same document.
+    # onclick: click the hidden trigger button in the same document.
+    # Don't rely on a global `event` object (not consistently present in Safari / inline handlers).
     _onclick = (
-        "event.preventDefault();"
         "(function(){var b=document.querySelector('[class*=st-key-ave_open_guide] button');"
-        "if(b)b.click();}())"
+        "if(b){b.click();}})();return false;"
     )
     return (
         f'<div class="ave-expl-title-unified">'
         f'<div class="ave-expl-title-unified__left">{strip}</div>'
-        f'<a class="ave-expl-title-unified__link" href="#" role="button" onclick="{_onclick}" aria-label="Open Explanations">Explanations</a>'
+        f'<button class="ave-expl-title-unified__link" type="button" onclick="{_onclick}" aria-label="Open Explanations">Explanations</button>'
         f"</div>"
     )
 
@@ -847,6 +849,368 @@ def _render_snippet_row_streamlit(
         _render_snippet_block(
             _snippet_card_inner_html(row, archetypes=archetypes, stances=stances, visions=visions)
         )
+
+
+@st.cache_data(show_spinner=True)
+def _loop_pairs_model_from_csv(csv_path: str) -> dict[str, object]:
+    """Compute loop lags + shock months using VAR on ILR coords (from `extract_narrrative_pairs.py`)."""
+    try:
+        from statsmodels.tsa.vector_ar.var_model import VAR
+    except ModuleNotFoundError as e:
+        if getattr(e, "name", None) == "statsmodels":
+            return {"_error": "Missing dependency: `statsmodels`."}
+        raise
+
+    df = _load_data(csv_path).copy()
+    need = {"date", "archetype", "majority_stance", "paragraph"}
+    if not need.issubset(set(df.columns)):
+        return {"_error": f"CSV missing required columns: {sorted(need - set(df.columns))}"}
+
+    d = df.dropna(subset=["date", "archetype"]).copy()
+    if d.empty:
+        return {"_error": "No rows with date + archetype."}
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date"])
+    if d.empty:
+        return {"_error": "No parsable dates in the CSV."}
+
+    counts = (
+        d.assign(date=d["date"].dt.to_period("M").dt.to_timestamp())
+        .groupby(["date", "archetype"])
+        .size()
+        .unstack(fill_value=0)
+    )
+    for col in ("Builder", "Guardian", "Pioneer"):
+        if col not in counts.columns:
+            counts[col] = 0
+    counts = counts[["Builder", "Guardian", "Pioneer"]]
+    idx = pd.period_range(counts.index.min(), counts.index.max(), freq="M").to_timestamp()
+    counts = counts.reindex(idx, fill_value=0).asfreq("MS")
+
+    eps = 1e-6
+    z1 = np.sqrt(2 / 3) * np.log(
+        (counts["Pioneer"] + eps)
+        / np.sqrt((counts["Builder"] + eps) * (counts["Guardian"] + eps))
+    )
+    z2 = np.sqrt(1 / 2) * np.log((counts["Builder"] + eps) / (counts["Guardian"] + eps))
+    ilr = pd.DataFrame({"z1": z1, "z2": z2}, index=counts.index).dropna()
+    if len(ilr) < 30:
+        return {"_error": f"Not enough monthly observations for VAR (have {len(ilr)} months)."}
+
+    t = np.arange(len(ilr))
+    X = np.c_[np.ones_like(t), t, np.sin(2 * np.pi / 12 * t), np.cos(2 * np.pi / 12 * t)]
+    dilr = ilr.copy()
+    for col in ilr.columns:
+        b = np.linalg.lstsq(X, ilr[col].to_numpy(), rcond=None)[0]
+        dilr[col] = (ilr[col] - (X @ b)).diff()
+    dilr = dilr.dropna()
+    if len(dilr) < 24:
+        return {"_error": f"Not enough post-diff observations for VAR (have {len(dilr)} months)."}
+
+    m = pd.Index(dilr.index).month
+    exog = pd.get_dummies(m, drop_first=True, dtype=float)
+    exog.index = dilr.index
+    lags = 3
+    res = VAR(dilr, exog=exog).fit(lags, trend="c")
+    residuals = pd.DataFrame(res.resid, columns=dilr.columns, index=dilr.index)
+    irf_mat = res.irf(12).irfs
+
+    def _get_peak_lag(imp_idx: int, imp_sign: int, resp_idx: int, resp_sign: int) -> int:
+        curve = irf_mat[1:, resp_idx, imp_idx] * imp_sign
+        return (int(np.argmax(curve)) if resp_sign > 0 else int(np.argmin(curve))) + 1
+
+    l_p2g = _get_peak_lag(0, 1, 1, -1)
+    l_g2p = _get_peak_lag(1, -1, 0, 1)
+    l_g2b = _get_peak_lag(1, -1, 1, 1)
+    l_p2b = _get_peak_lag(0, 1, 1, 1)
+    l_b2p = _get_peak_lag(1, 1, 0, -1)
+
+    shocks = {
+        "P": residuals.nlargest(6, "z1").index.to_list(),
+        "G": residuals.nsmallest(6, "z2").index.to_list(),
+        "B": residuals.nlargest(6, "z2").index.to_list(),
+    }
+    return {
+        "lags": {"P2G": l_p2g, "G2P": l_g2p, "G2B": l_g2b, "P2B": l_p2b, "B2P": l_b2p},
+        "shocks": shocks,
+    }
+
+
+_LOOP_STOPWORDS = frozenset(
+    {
+        "the",
+        "and",
+        "to",
+        "of",
+        "a",
+        "in",
+        "that",
+        "is",
+        "for",
+        "it",
+        "with",
+        "as",
+        "on",
+        "are",
+        "be",
+        "this",
+        "by",
+        "or",
+        "an",
+        "will",
+        "can",
+        "from",
+        "at",
+        "not",
+        "we",
+        "have",
+        "but",
+        "has",
+        "which",
+        "they",
+        "more",
+        "their",
+        "about",
+        "what",
+        "how",
+        "when",
+        "who",
+        "there",
+        "would",
+        "could",
+        "should",
+        "our",
+        "you",
+        "all",
+        "so",
+        "up",
+        "out",
+        "if",
+        "get",
+        "go",
+        "me",
+        "some",
+        "make",
+        "like",
+        "time",
+        "no",
+        "just",
+        "him",
+        "know",
+        "take",
+        "people",
+        "into",
+        "year",
+        "your",
+        "good",
+        "see",
+        "other",
+        "than",
+        "then",
+        "now",
+        "look",
+        "only",
+        "come",
+        "its",
+    }
+)
+
+
+def _loop_keywords(text: str) -> set[str]:
+    return set(re.findall(r"\b[a-z]{4,}\b", str(text or "").lower())) - set(_LOOP_STOPWORDS)
+
+
+def _loop_pick_paragraph(
+    df: pd.DataFrame,
+    *,
+    target_month: pd.Timestamp,
+    archetype: str,
+    target_stance: str | None = None,
+    anchor_text: str | None = None,
+) -> pd.Series | None:
+    pool = df.copy()
+    pool["date"] = pd.to_datetime(pool["date"], errors="coerce")
+    pool = pool.dropna(subset=["date", "archetype", "paragraph"])
+    pool = pool[
+        (pool["date"].dt.year == int(target_month.year))
+        & (pool["date"].dt.month == int(target_month.month))
+        & (pool["archetype"].astype(str) == str(archetype))
+    ].copy()
+    if pool.empty:
+        return None
+
+    pool["_len"] = pool["paragraph"].astype(str).str.len()
+    pool["_stance_ok"] = (
+        (pool["majority_stance"].astype(str) == str(target_stance)) if target_stance else True
+    )
+    if anchor_text:
+        kws = _loop_keywords(anchor_text)
+        pool["_overlap"] = pool["paragraph"].astype(str).apply(
+            lambda x: len(kws.intersection(_loop_keywords(x)))
+        )
+    else:
+        pool["_overlap"] = 0
+
+    pool = pool.sort_values(by=["_stance_ok", "_overlap", "_len"], ascending=[False, False, False])
+    return pool.iloc[0]
+
+
+def _render_loop_pairs_page(df: pd.DataFrame, *, csv_path: str) -> None:
+    model = _loop_pairs_model_from_csv(csv_path)
+    if isinstance(model, dict) and model.get("_error"):
+        st.subheader("Loop pairs")
+        st.error(str(model["_error"]))
+        st.info("If this is a local run, install deps in your dashboard venv: `pip install statsmodels`.")
+        return
+
+    lags = (model or {}).get("lags", {})
+    shocks = (model or {}).get("shocks", {})
+    if not isinstance(lags, dict) or not isinstance(shocks, dict):
+        st.subheader("Loop pairs")
+        st.error("Loop model did not return expected outputs.")
+        return
+
+    loop_presets: dict[str, list[dict[str, str]]] = {
+        "Dominant loop": [
+            {
+                "title": "Pioneer → Guardian (friction)",
+                "shock_key": "P",
+                "imp_arch": "Pioneer",
+                "imp_stance": "Opening",
+                "resp_arch": "Guardian",
+                "resp_stance": "Controlling",
+                "lag_key": "P2G",
+            },
+            {
+                "title": "Guardian → Pioneer (rebound)",
+                "shock_key": "G",
+                "imp_arch": "Guardian",
+                "imp_stance": "Controlling",
+                "resp_arch": "Pioneer",
+                "resp_stance": "Opening",
+                "lag_key": "G2P",
+            },
+        ],
+        "Translation loop": [
+            {
+                "title": "Guardian → Builder (mobilization)",
+                "shock_key": "G",
+                "imp_arch": "Guardian",
+                "imp_stance": "Controlling",
+                "resp_arch": "Builder",
+                "resp_stance": "Mobilizing",
+                "lag_key": "G2B",
+            },
+            {
+                "title": "Builder → Pioneer (suppression)",
+                "shock_key": "B",
+                "imp_arch": "Builder",
+                "imp_stance": "Mobilizing",
+                "resp_arch": "Pioneer",
+                "resp_stance": "Opening",
+                "lag_key": "B2P",
+            },
+        ],
+        "Catalytic loop": [
+            {
+                "title": "Pioneer → Builder (translation)",
+                "shock_key": "P",
+                "imp_arch": "Pioneer",
+                "imp_stance": "Opening",
+                "resp_arch": "Builder",
+                "resp_stance": "Mobilizing",
+                "lag_key": "P2B",
+            },
+            {
+                "title": "Builder → Pioneer (suppression)",
+                "shock_key": "B",
+                "imp_arch": "Builder",
+                "imp_stance": "Mobilizing",
+                "resp_arch": "Pioneer",
+                "resp_stance": "Opening",
+                "lag_key": "B2P",
+            },
+        ],
+    }
+
+    preset_name = str(st.session_state.get("ave_loop_pairs_preset_name") or "Dominant loop")
+    if preset_name not in loop_presets:
+        preset_name = "Dominant loop"
+    n_examples = int(st.session_state.get("ave_loop_pairs_n_examples") or 2)
+    n_examples = max(1, min(6, n_examples))
+    use_anchor = bool(st.session_state.get("ave_loop_pairs_anchor", True))
+
+    st.subheader(f"{preset_name} — narrative pairs")
+    st.caption(
+        "Each loop shows multiple examples per direction (shock months chosen from the model’s strongest residuals). "
+        "On narrow screens, cards stack vertically."
+    )
+
+    def _pair_html(imp_row: pd.Series | None, resp_row: pd.Series | None, *, lag: int) -> str:
+        a = (
+            _snippet_card_inner_html(imp_row, archetypes=[], stances=[], visions=[])
+            if imp_row is not None
+            else "<div class='ave-loop-missing'>No shock snippet found for this month.</div>"
+        )
+        b = (
+            _snippet_card_inner_html(resp_row, archetypes=[], stances=[], visions=[])
+            if resp_row is not None
+            else "<div class='ave-loop-missing'>No response snippet found for this month.</div>"
+        )
+        return (
+            "<div class='ave-loop-pair'>"
+            f"<div class='ave-loop-pair__left'>{a}</div>"
+            "<div class='ave-loop-arrow'>"
+            "<div class='ave-loop-arrow__glyph ave-loop-arrow__glyph--h'>→</div>"
+            "<div class='ave-loop-arrow__glyph ave-loop-arrow__glyph--v'>↓</div>"
+            f"<div class='ave-loop-arrow__lag'>T+{int(lag)}</div>"
+            "</div>"
+            f"<div class='ave-loop-pair__right'>{b}</div>"
+            "</div>"
+        )
+
+    for edge in loop_presets[preset_name]:
+        edge_title = str(edge["title"])
+        lag = int(lags.get(str(edge["lag_key"]), 1))
+        shock_months = [pd.Timestamp(x) for x in (shocks.get(str(edge["shock_key"]), []) or [])][:n_examples]
+        st.markdown(f"### {edge_title} · top {len(shock_months)} example(s) · lag T+{lag}")
+        if not shock_months:
+            st.warning("No shock months available for this direction.")
+            continue
+
+        for sm in shock_months:
+            imp = _loop_pick_paragraph(
+                df,
+                target_month=pd.Timestamp(sm),
+                archetype=str(edge["imp_arch"]),
+                target_stance=str(edge["imp_stance"]),
+                anchor_text=None,
+            )
+            anchor_text = str(imp.get("paragraph")) if (use_anchor and imp is not None) else None
+            resp_month = pd.Timestamp(sm) + pd.DateOffset(months=int(lag))
+            resp = _loop_pick_paragraph(
+                df,
+                target_month=pd.Timestamp(resp_month),
+                archetype=str(edge["resp_arch"]),
+                target_stance=str(edge["resp_stance"]),
+                anchor_text=anchor_text,
+            )
+            st.markdown(
+                f"<div class='ave-loop-card-head'>Shock {pd.Timestamp(sm).strftime('%Y-%m')} "
+                f"→ Response {pd.Timestamp(resp_month).strftime('%Y-%m')}</div>",
+                unsafe_allow_html=True,
+            )
+            _render_snippet_block(_pair_html(imp, resp, lag=lag))
+            with st.expander("Show row data", expanded=False):
+                rows = []
+                if imp is not None:
+                    rows.append(dict(imp))
+                if resp is not None:
+                    rows.append(dict(resp))
+                show = pd.DataFrame(rows)
+                if len(show) and "date" in show.columns:
+                    show["date"] = pd.to_datetime(show["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                st.dataframe(show, use_container_width=True, hide_index=True)
 
 
 def _inject_branding_css() -> None:
@@ -1650,6 +2014,29 @@ def _inject_branding_css() -> None:
     margin: 0 0 0.45rem 0;
     padding: 0;
   }
+  /* Sidebar view switch (Explorer | Loop pairs): make it read as a mode toggle, not a filter. */
+  section[data-testid="stSidebar"] [class*="st-key-ave_page"] {
+    margin: 0.15rem 0 0.65rem 0 !important;
+  }
+  section[data-testid="stSidebar"] [class*="st-key-ave_page"] div[data-baseweb="segmented-control"] {
+    background: rgba(241, 245, 249, 0.95) !important;
+    border: 1px solid rgba(148, 163, 184, 0.55) !important;
+    border-radius: 12px !important;
+    padding: 4px !important;
+  }
+  section[data-testid="stSidebar"] [class*="st-key-ave_page"] button {
+    border-radius: 10px !important;
+    font-weight: 650 !important;
+  }
+  section[data-testid="stSidebar"] [class*="st-key-ave_page"] button[aria-checked="true"] {
+    background: #1f4e79 !important; /* dark blue selected */
+    color: #ffffff !important;
+    box-shadow: 0 1px 1px rgba(15, 23, 42, 0.18) !important;
+  }
+  section[data-testid="stSidebar"] [class*="st-key-ave_page"] button[aria-checked="false"] {
+    background: transparent !important;
+    color: #2f4a5e !important;
+  }
   /* Prominent entry to the filters panel on phones (row tagged by JS) */
   [data-testid="stMain"] div[data-testid="stHorizontalBlock"].ave-mobile-filters-strip {
     display: none !important;
@@ -1679,62 +2066,37 @@ def _inject_branding_css() -> None:
     }
   }
   /*
-    Title row: single HTML flex bar (``.ave-expl-title-unified``) — avoids Streamlit column shrink / label wrap.
+    Title row: unified bar (container key ``ave_expl_title_unified``).
+    Use native Streamlit button for Explanations (reliable across browsers; avoids JS DOM-click hacks).
   */
-  [data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.ave-expl-title-unified) {
+  [data-testid="stMain"] [class*="st-key-ave_expl_title_unified"] {
     display: block !important;
     width: 100% !important;
     max-width: min(100%, 72rem) !important;
     margin: 0 auto 0.35rem auto !important;
-    padding: 0 !important;
-    background: transparent !important;
-    border: none !important;
-    box-shadow: none !important;
-  }
-  [data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.ave-expl-title-unified) [data-testid="stElementContainer"],
-  [data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.ave-expl-title-unified) [data-testid="element-container"] {
-    margin: 0 !important;
-    padding: 0 !important;
-  }
-  .ave-expl-title-unified {
-    display: flex !important;
-    flex-direction: row !important;
-    flex-wrap: nowrap !important;
-    align-items: center !important;
-    justify-content: space-between !important;
-    gap: 0.75rem !important;
-    width: 100% !important;
-    box-sizing: border-box !important;
-    margin: 0 !important;
     padding: 0.5rem 0.85rem !important;
+    box-sizing: border-box !important;
     border-radius: 8px !important;
     /* Slightly richer than the old bar: clearer blue-teal, less muddy brown */
     background: linear-gradient(125deg, #2a4f72 0%, #3d6f9a 48%, #4f6d8a 100%) !important;
     box-shadow: 0 2px 10px rgba(25, 45, 72, 0.18) !important;
   }
-  .ave-expl-title-unified__left {
-    flex: 1 1 auto !important;
-    min-width: 0 !important;
-    display: flex !important;
-    align-items: center !important;
-  }
-  .ave-expl-title-unified .ave-main-strip--in-expl-row,
-  .ave-expl-title-unified .ave-main-strip.ave-main-strip--in-expl-row {
+  [data-testid="stMain"] [class*="st-key-ave_expl_title_unified"] .ave-main-strip--in-expl-row,
+  [data-testid="stMain"] [class*="st-key-ave_expl_title_unified"] .ave-main-strip.ave-main-strip--in-expl-row {
     background: transparent !important;
     box-shadow: none !important;
     margin: 0 !important;
     padding: 0 !important;
     border-radius: 0 !important;
   }
-  .ave-expl-title-unified .ave-main-strip-inner strong {
+  [data-testid="stMain"] [class*="st-key-ave_expl_title_unified"] .ave-main-strip-inner strong {
     line-height: 1.2 !important;
     vertical-align: middle;
   }
-  .ave-expl-title-unified__link {
-    flex: 0 0 auto !important;
+  /* Style the native Streamlit button like the old pill link. */
+  [data-testid="stMain"] [class*="st-key-ave_open_guide"] .stButton > button,
+  [data-testid="stMain"] [class*="st-key-ave_open_guide"] button {
     white-space: nowrap !important;
-    text-decoration: none !important;
-    margin: 0 !important;
     background: rgba(255, 255, 255, 0.18) !important;
     border: 1px solid rgba(255, 255, 255, 0.58) !important;
     color: #f8fafc !important;
@@ -1747,27 +2109,22 @@ def _inject_branding_css() -> None:
     word-break: normal !important;
     overflow-wrap: normal !important;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08) !important;
+    cursor: pointer !important;
+    appearance: none !important;
+    -webkit-appearance: none !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
   }
-  .ave-expl-title-unified__link:hover {
+  [data-testid="stMain"] [class*="st-key-ave_open_guide"] .stButton > button:hover,
+  [data-testid="stMain"] [class*="st-key-ave_open_guide"] button:hover {
     background: rgba(255, 255, 255, 0.28) !important;
     border-color: rgba(255, 255, 255, 0.92) !important;
     color: #ffffff !important;
   }
-  /* Hidden guide trigger button — JS-clicked only, visually invisible. */
-  [data-testid="stMain"] [class*="st-key-ave_open_guide"] {
-    position: absolute !important;
-    left: -9999px !important;
-    top: -9999px !important;
-    width: 0 !important;
-    height: 0 !important;
-    overflow: hidden !important;
-    pointer-events: none !important;
-  }
   @media (max-width: 560px) {
-    .ave-expl-title-unified {
-      flex-wrap: wrap !important;
-    }
-    .ave-expl-title-unified__link {
+    [data-testid="stMain"] [class*="st-key-ave_open_guide"] .stButton > button,
+    [data-testid="stMain"] [class*="st-key-ave_open_guide"] button {
       width: 100% !important;
       text-align: center !important;
       box-sizing: border-box !important;
@@ -2446,6 +2803,82 @@ def _inject_branding_css() -> None:
     hyphens: none;
     overflow-wrap: break-word;
     word-break: normal;
+  }
+  /* Loop pairs: arrow between the two snippet cards */
+  .ave-loop-pair {
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    justify-content: space-between;
+    gap: 1.1rem;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .ave-loop-pair__left,
+  .ave-loop-pair__right {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  .ave-loop-arrow {
+    flex: 0 0 4.25rem;
+    min-width: 4.25rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35rem;
+    color: #4a6b82;
+    user-select: none;
+  }
+  .ave-loop-arrow__glyph {
+    font-size: 2.25rem;
+    line-height: 1;
+    font-weight: 800;
+    opacity: 0.9;
+  }
+  .ave-loop-arrow__glyph--v { display: none; }
+  .ave-loop-arrow__lag {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: #475569;
+    background: rgba(255, 255, 255, 0.9);
+    border: 1px solid rgba(213, 218, 224, 0.9);
+    border-radius: 999px;
+    padding: 0.16rem 0.5rem;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  }
+  .ave-loop-card-head {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-weight: 700;
+    color: #334155;
+    font-size: 0.88rem;
+    margin: 0 0 0.35rem 0;
+  }
+  .ave-loop-missing {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 0.9rem;
+    color: #475569;
+    background: rgba(248, 250, 252, 0.9);
+    border: 1px solid rgba(213, 218, 224, 0.9);
+    border-radius: 12px;
+    padding: 1rem;
+  }
+  /* Narrow screens: stack cards so they don't become thin columns */
+  @media (max-width: 980px) {
+    .ave-loop-pair {
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .ave-loop-arrow {
+      flex: 0 0 auto;
+      min-width: 0;
+      width: 100%;
+      flex-direction: row;
+      justify-content: center;
+    }
+    .ave-loop-arrow__glyph--h { display: none; }
+    .ave-loop-arrow__glyph--v { display: block; }
   }
 </style>
         """,
@@ -3919,10 +4352,56 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
-    st.sidebar.markdown(
-        '<p class="ave-sidebar-filters-heading">Filters</p>',
-        unsafe_allow_html=True,
-    )
+
+    if "ave_page" not in st.session_state:
+        st.session_state["ave_page"] = "Explorer"
+
+    with st.sidebar:
+        # Page switcher: make this look distinct from "Filters".
+        _prev_page = st.session_state.get("ave_page")
+        _page = st.segmented_control(
+            "View",
+            options=["Explorer", "Loop pairs"],
+            key="ave_page",
+            label_visibility="collapsed",
+        )
+        if _page != _prev_page:
+            st.rerun()
+
+        if st.session_state.get("ave_page") == "Loop pairs":
+            st.caption("Pick a loop; the main area shows multiple examples in both directions.")
+            # Sidebar controls (also used by the page renderer via session_state).
+            _lp_model = _loop_pairs_model_from_csv(csv_path)
+            _lp_err = _lp_model.get("_error") if isinstance(_lp_model, dict) else None
+            if _lp_err:
+                st.error(str(_lp_err))
+            else:
+                st.selectbox(
+                    "Loop preset",
+                    ["Dominant loop", "Translation loop", "Catalytic loop"],
+                    key="ave_loop_pairs_preset_name",
+                    help="Each preset includes (at least) two directed pair types so you can see the loop 'both ways'.",
+                )
+                st.slider(
+                    "Examples per direction",
+                    min_value=1,
+                    max_value=6,
+                    value=2,
+                    step=1,
+                    key="ave_loop_pairs_n_examples",
+                    help="How many of the model’s strongest shock months to show for each direction.",
+                )
+                st.checkbox(
+                    "Prefer thematic overlap for the response",
+                    value=True,
+                    key="ave_loop_pairs_anchor",
+                    help="Within the target month + archetype (+ stance), prioritize responses that share meaningful words with the shock paragraph.",
+                )
+
+        st.markdown(
+            '<p class="ave-sidebar-filters-heading">Filters</p>',
+            unsafe_allow_html=True,
+        )
 
     _ps_raw = st.session_state.get("dash_page_size", 50)
     try:
@@ -3945,6 +4424,11 @@ def main() -> None:
     _expand_sidebar_button_label_script()
     # _popover_adjust_filters_client_script()
     _mobile_filters_strip_script()
+
+    # Loop pairs view: after sidebar is built/styled so the logo + rollups stay on top.
+    if st.session_state.get("ave_page") == "Loop pairs":
+        _render_loop_pairs_page(df, csv_path=csv_path)
+        st.stop()
 
     focus = st.session_state.get(_FILTER_FOCUS_KEY)
 
@@ -4144,12 +4628,15 @@ def main() -> None:
             out_list = out
             out_full = None
 
-    # Hidden trigger button — JS in the Explanations link clicks this to open guide without page navigation.
-    if st.button("", key="ave_open_guide"):
-        st.session_state[AVE_SHOW_GUIDE_KEY] = True
-        st.rerun()
-    # Title + Explanations: one HTML flex row (onclick JS clicks hidden button above; avoids session-resetting navigation).
-    st.markdown(_explorer_title_bar_row_html(_icon_uri), unsafe_allow_html=True)
+    # Title + Explanations: native Streamlit button (reliable click behavior across browsers).
+    with st.container(key="ave_expl_title_unified"):
+        left, right = st.columns([7.5, 1.8], vertical_alignment="center")
+        with left:
+            st.markdown(_explorer_title_bar_html(_icon_uri), unsafe_allow_html=True)
+        with right:
+            if st.button("Explanations", key="ave_open_guide", use_container_width=True):
+                st.session_state[AVE_SHOW_GUIDE_KEY] = True
+                st.rerun()
 
     st.markdown('<div id="ave-top" style="height:1px;margin:0;padding:0;"></div>', unsafe_allow_html=True)
     _jm = "ALL" if match_all else "ANY"
