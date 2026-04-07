@@ -1220,6 +1220,7 @@ def _render_loop_pairs_page(df: pd.DataFrame, *, csv_path: str) -> None:
     n_examples = int(st.session_state.get("ave_loop_pairs_n_examples") or 2)
     n_examples = max(1, min(6, n_examples))
     use_anchor = bool(st.session_state.get("ave_loop_pairs_anchor", True))
+    ordering = str(st.session_state.get("ave_loop_pairs_ordering") or "Model shock strength (VAR residual)")
     try:
         resp_fuzz = int(st.session_state.get("ave_loop_pairs_resp_month_fuzz", 1) or 0)
     except (TypeError, ValueError):
@@ -1234,6 +1235,51 @@ def _render_loop_pairs_page(df: pd.DataFrame, *, csv_path: str) -> None:
             shock_month_override = None
 
     st.subheader(f"{preset_name} — narrative pairs")
+
+    def _order_auto_shock_months(edge: dict[str, str], months: list[pd.Timestamp]) -> list[pd.Timestamp]:
+        if ordering == "Time (newest first)":
+            return sorted(months, reverse=True)
+        if ordering == "Time (oldest first)":
+            return sorted(months)
+        if ordering in ("Best story (keyword overlap)", "Most novel response (distinct keywords)"):
+            lag = int(lags.get(str(edge.get("lag_key")), 1))
+            scored: list[tuple[int, int, pd.Timestamp]] = []
+            for ix, sm in enumerate(months):
+                imp = _loop_pick_paragraph(
+                    df,
+                    target_month=pd.Timestamp(sm),
+                    month_window=0,
+                    archetype=str(edge.get("imp_arch")),
+                    target_stance=str(edge.get("imp_stance")),
+                    anchor_text=None,
+                )
+                if imp is None:
+                    scored.append((-10**9, ix, pd.Timestamp(sm)))
+                    continue
+                shock_text = str(imp.get("paragraph") or "")
+                shock_kws = _loop_keywords(shock_text)
+                resp_month = pd.Timestamp(sm) + pd.DateOffset(months=int(lag))
+                resp = _loop_pick_paragraph(
+                    df,
+                    target_month=pd.Timestamp(resp_month),
+                    month_window=resp_fuzz,
+                    archetype=str(edge.get("resp_arch")),
+                    target_stance=str(edge.get("resp_stance")),
+                    anchor_text=(shock_text if use_anchor else None),
+                )
+                if resp is None:
+                    scored.append((-10**9, ix, pd.Timestamp(sm)))
+                    continue
+                resp_text = str(resp.get("paragraph") or "")
+                resp_kws = _loop_keywords(resp_text)
+                overlap = len(shock_kws.intersection(resp_kws))
+                distinct = len(resp_kws.difference(shock_kws))
+                score = overlap if ordering == "Best story (keyword overlap)" else distinct
+                scored.append((int(score), ix, pd.Timestamp(sm)))
+            scored.sort(key=lambda t: (t[0], -t[1]), reverse=True)
+            return [t[2] for t in scored]
+        # Default: keep VAR residual order (already ranked by model).
+        return months
     # Summary pills under the header (what loop, which shocks exist, and when they occur).
     try:
         _edge_n = len(loop_presets.get(preset_name, []))
@@ -1459,7 +1505,9 @@ def _render_loop_pairs_page(df: pd.DataFrame, *, csv_path: str) -> None:
         if shock_month_override is not None:
             shock_months = [pd.Timestamp(shock_month_override)]
         else:
-            shock_months = [pd.Timestamp(x) for x in (shocks.get(str(edge["shock_key"]), []) or [])][:n_examples]
+            _raw = [pd.Timestamp(x) for x in (shocks.get(str(edge["shock_key"]), []) or [])]
+            _raw = _order_auto_shock_months(edge, _raw)
+            shock_months = _raw[:n_examples]
         _n_lab = len(shock_months)
         _which = "selected month" if shock_month_override is not None else f"top {_n_lab} example(s)"
         _fuzz_lab = f" · response window ±{resp_fuzz}m" if resp_fuzz else ""
@@ -4778,6 +4826,27 @@ def main() -> None:
                     key="ave_loop_pairs_n_examples",
                     help="How many of the model’s strongest shock months to show for each direction.",
                 )
+                st.selectbox(
+                    "Ordering (Auto shock months)",
+                    [
+                        "Model shock strength (VAR residual)",
+                        "Time (newest first)",
+                        "Time (oldest first)",
+                        "Best story (keyword overlap)",
+                        "Most novel response (distinct keywords)",
+                    ],
+                    key="ave_loop_pairs_ordering",
+                    help="Only affects Auto (top shocks). When you override Shock month, ordering is irrelevant.",
+                )
+                with st.expander("Ordering help", expanded=False):
+                    st.markdown(
+                        "- **Model shock strength**: uses the VAR residual ranking (current default).\n"
+                        "- **Time**: sorts auto shock months chronologically.\n"
+                        "- **Best story**: prefers shock months whose *picked* response shares the most meaningful keywords.\n"
+                        "- **Most novel response**: prefers shock months whose response introduces the most new keywords.\n"
+                        "\n"
+                        "These ordering modes rank the *shock months* shown in Auto mode; they don’t change the VAR model itself.",
+                    )
                 st.slider(
                     "Response-month fuzziness (± months)",
                     min_value=0,
@@ -4799,7 +4868,7 @@ def main() -> None:
                     .to_list()
                 )
                 st.selectbox(
-                    "Shock month (optional)",
+                    "Shock month (override)",
                     options=["Auto (top shocks)"] + _months,
                     key="ave_loop_pairs_shock_month_label",
                     help="Override the shock month to explore a specific episode. "
@@ -5131,15 +5200,7 @@ def main() -> None:
         f"</div>",
         unsafe_allow_html=True,
     )
-    sb_d1, sb_d2, sb_d3 = st.sidebar.columns(3)
-    with sb_d1:
-        st.button(
-            "⚙️ Open filters",
-            on_click=_nav_primary_cb,
-            key="sb_open_filters",
-            use_container_width=True,
-            help="Scroll to filter controls.",
-        )
+    sb_d2, sb_d3 = st.sidebar.columns(2)
     with sb_d2:
         st.button(
             "Apply filters",
