@@ -1893,6 +1893,10 @@ def _inject_branding_css() -> None:
   /* Main top padding — don’t exaggerate (large gap reads as “empty blue”) */
   [data-testid="stMain"] .block-container {
     padding-top: 3.25rem !important;
+    /* Global content width: keep everything aligned to the top blue strip */
+    max-width: var(--ave-explore-snippet-max) !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
   }
   @media (max-width: 768px) {
     [data-testid="stMain"] .block-container {
