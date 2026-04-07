@@ -1827,7 +1827,8 @@ def _inject_branding_css() -> None:
     (single wide column). Updated by _snippet_grid_responsive_script.
   */
   :root {
-    --ave-explore-snippet-max: min(90rem, 100%);
+    /* Keep Explorer content aligned with the top dock (≈72rem). */
+    --ave-explore-snippet-max: min(72rem, 100%);
   }
   /*
     Sidebar expand: match slate/teal top-bar strip (.ave-main-strip); three vertical bars replace chevrons.
@@ -2753,6 +2754,15 @@ def _inject_branding_css() -> None:
     border-color: rgba(255, 255, 255, 0.92) !important;
     color: #ffffff !important;
   }
+  /* Explanations pages: constrain width like main content (avoid giant white gutters). */
+  [data-testid="stMain"] [class*="st-key-ave_guide_width"] {
+    width: 100% !important;
+    max-width: min(72rem, 100%) !important;
+    margin: 0 auto !important;
+    padding-left: 0.25rem !important;
+    padding-right: 0.25rem !important;
+    box-sizing: border-box !important;
+  }
   @media (max-width: 560px) {
     [data-testid="stMain"] [class*="st-key-ave_open_guide"] .stButton > button,
     [data-testid="stMain"] [class*="st-key-ave_open_guide"] button {
@@ -3043,7 +3053,7 @@ def _inject_branding_css() -> None:
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 1.85rem 2rem;
     width: 100%;
-    max-width: min(90rem, 100%);
+    max-width: var(--ave-explore-snippet-max);
     margin: 0 auto;
     box-sizing: border-box;
   }
@@ -4948,10 +4958,11 @@ def main() -> None:
         if not mode_raw:
             mode_raw = "loops" if str(st.session_state.get("ave_page") or "") == "Loop pairs" else "main"
         mode = str(mode_raw)
-        if mode == "loops":
-            _render_loops_guide_page()
-        else:
-            render_guide_page()
+        with st.container(key="ave_guide_width"):
+            if mode == "loops":
+                _render_loops_guide_page()
+            else:
+                render_guide_page()
         st.stop()
 
     csv_path = _dashboard_csv_path(_PROJECT_ROOT)
