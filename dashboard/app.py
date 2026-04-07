@@ -390,7 +390,7 @@ def _brand_icon_data_uri() -> str:
         return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
 
 
-def _explorer_title_bar_html(icon_uri: str) -> str:
+def _explorer_title_bar_html(icon_uri: str, *, title: str = "AI Vision Explorer") -> str:
     """Brand + title strip (used alone or inside :func:`_explorer_title_bar_row_html`)."""
     brand = ""
     if os.path.isfile(_BRAND_SVG_PATH):
@@ -405,9 +405,9 @@ def _explorer_title_bar_html(icon_uri: str) -> str:
             f'<img class="ave-strip-icon" src="{safe}" alt="" /></span>'
         )
     if brand:
-        inner = f'<span class="ave-main-strip-inner">{brand} <strong>AI Vision Explorer</strong></span>'
+        inner = f'<span class="ave-main-strip-inner">{brand} <strong>{html.escape(title)}</strong></span>'
     else:
-        inner = '<span class="ave-main-strip-inner">🔭 &nbsp; <strong>AI Vision Explorer</strong></span>'
+        inner = f'<span class="ave-main-strip-inner">🔭 &nbsp; <strong>{html.escape(title)}</strong></span>'
     return f'<div class="ave-main-strip ave-main-strip--in-expl-row">{inner}</div>'
 
 
@@ -1024,6 +1024,7 @@ def _loop_pick_paragraph(
     df: pd.DataFrame,
     *,
     target_month: pd.Timestamp,
+    month_window: int = 0,
     archetype: str,
     target_stance: str | None = None,
     anchor_text: str | None = None,
@@ -1031,9 +1032,17 @@ def _loop_pick_paragraph(
     pool = df.copy()
     pool["date"] = pd.to_datetime(pool["date"], errors="coerce")
     pool = pool.dropna(subset=["date", "archetype", "paragraph"])
+    try:
+        w = int(month_window or 0)
+    except (TypeError, ValueError):
+        w = 0
+    w = max(0, min(12, w))
+
+    pool["_ym"] = pool["date"].dt.year.astype(int) * 12 + pool["date"].dt.month.astype(int)
+    tm_ym = int(pd.Timestamp(target_month).year) * 12 + int(pd.Timestamp(target_month).month)
+    pool["_month_dist"] = (pool["_ym"] - tm_ym).abs()
     pool = pool[
-        (pool["date"].dt.year == int(target_month.year))
-        & (pool["date"].dt.month == int(target_month.month))
+        (pool["_month_dist"] <= w)
         & (pool["archetype"].astype(str) == str(archetype))
     ].copy()
     if pool.empty:
@@ -1051,13 +1060,63 @@ def _loop_pick_paragraph(
     else:
         pool["_overlap"] = 0
 
-    pool = pool.sort_values(by=["_stance_ok", "_overlap", "_len"], ascending=[False, False, False])
+    pool = pool.sort_values(
+        by=["_stance_ok", "_month_dist", "_overlap", "_len"],
+        ascending=[False, True, False, False],
+    )
     return pool.iloc[0]
+
+
+def _loop_count_candidates(
+    df: pd.DataFrame,
+    *,
+    target_month: pd.Timestamp,
+    month_window: int = 0,
+    archetype: str,
+    target_stance: str | None = None,
+) -> int:
+    """Count candidate paragraphs for (archetype, stance) in target_month ± window.
+
+    This intentionally does NOT use `anchor_text`/overlap: it's meant for "how many pairs exist"
+    under the current month-window constraints, not "which one is best".
+    """
+    pool = df.copy()
+    pool["date"] = pd.to_datetime(pool["date"], errors="coerce")
+    pool = pool.dropna(subset=["date", "archetype", "paragraph"])
+    try:
+        w = int(month_window or 0)
+    except (TypeError, ValueError):
+        w = 0
+    w = max(0, min(12, w))
+
+    pool["_ym"] = pool["date"].dt.year.astype(int) * 12 + pool["date"].dt.month.astype(int)
+    tm_ym = int(pd.Timestamp(target_month).year) * 12 + int(pd.Timestamp(target_month).month)
+    pool["_month_dist"] = (pool["_ym"] - tm_ym).abs()
+    pool = pool[
+        (pool["_month_dist"] <= w)
+        & (pool["archetype"].astype(str) == str(archetype))
+    ].copy()
+    if pool.empty:
+        return 0
+    if target_stance:
+        pool = pool[pool["majority_stance"].astype(str) == str(target_stance)].copy()
+    return int(len(pool))
 
 
 def _render_loop_pairs_page(df: pd.DataFrame, *, csv_path: str) -> None:
     model = _loop_pairs_model_from_csv(csv_path)
     if isinstance(model, dict) and model.get("_error"):
+        with st.container(key="ave_expl_title_unified"):
+            left, right = st.columns([7.5, 1.8], vertical_alignment="center")
+            with left:
+                st.markdown(
+                    _explorer_title_bar_html(_brand_icon_data_uri(), title="AI Loops Explorer"),
+                    unsafe_allow_html=True,
+                )
+            with right:
+                if st.button("Explanations", key="ave_open_guide", use_container_width=True):
+                    st.session_state[AVE_SHOW_GUIDE_KEY] = True
+                    st.rerun()
         st.subheader("Loop pairs")
         st.error(str(model["_error"]))
         st.info("If this is a local run, install deps in your dashboard venv: `pip install statsmodels`.")
@@ -1066,9 +1125,31 @@ def _render_loop_pairs_page(df: pd.DataFrame, *, csv_path: str) -> None:
     lags = (model or {}).get("lags", {})
     shocks = (model or {}).get("shocks", {})
     if not isinstance(lags, dict) or not isinstance(shocks, dict):
+        with st.container(key="ave_expl_title_unified"):
+            left, right = st.columns([7.5, 1.8], vertical_alignment="center")
+            with left:
+                st.markdown(
+                    _explorer_title_bar_html(_brand_icon_data_uri(), title="AI Loops Explorer"),
+                    unsafe_allow_html=True,
+                )
+            with right:
+                if st.button("Explanations", key="ave_open_guide", use_container_width=True):
+                    st.session_state[AVE_SHOW_GUIDE_KEY] = True
+                    st.rerun()
         st.subheader("Loop pairs")
         st.error("Loop model did not return expected outputs.")
         return
+
+    # Top bar (match Explorer styling).
+    _icon_uri = _brand_icon_data_uri()
+    with st.container(key="ave_expl_title_unified"):
+        left, right = st.columns([7.5, 1.8], vertical_alignment="center")
+        with left:
+            st.markdown(_explorer_title_bar_html(_icon_uri, title="AI Loops Explorer"), unsafe_allow_html=True)
+        with right:
+            if st.button("Explanations", key="ave_open_guide", use_container_width=True):
+                st.session_state[AVE_SHOW_GUIDE_KEY] = True
+                st.rerun()
 
     loop_presets: dict[str, list[dict[str, str]]] = {
         "Dominant loop": [
@@ -1139,12 +1220,215 @@ def _render_loop_pairs_page(df: pd.DataFrame, *, csv_path: str) -> None:
     n_examples = int(st.session_state.get("ave_loop_pairs_n_examples") or 2)
     n_examples = max(1, min(6, n_examples))
     use_anchor = bool(st.session_state.get("ave_loop_pairs_anchor", True))
+    try:
+        resp_fuzz = int(st.session_state.get("ave_loop_pairs_resp_month_fuzz", 1) or 0)
+    except (TypeError, ValueError):
+        resp_fuzz = 1
+    resp_fuzz = max(0, min(12, resp_fuzz))
+    shock_month_label = str(st.session_state.get("ave_loop_pairs_shock_month_label") or "Auto (top shocks)")
+    shock_month_override: pd.Timestamp | None = None
+    if shock_month_label and shock_month_label != "Auto (top shocks)":
+        try:
+            shock_month_override = pd.Timestamp(f"{shock_month_label}-01")
+        except Exception:
+            shock_month_override = None
 
     st.subheader(f"{preset_name} — narrative pairs")
-    st.caption(
-        "Each loop shows multiple examples per direction (shock months chosen from the model’s strongest residuals). "
-        "On narrow screens, cards stack vertically."
-    )
+    # Summary pills under the header (what loop, which shocks exist, and when they occur).
+    try:
+        _edge_n = len(loop_presets.get(preset_name, []))
+    except Exception:
+        _edge_n = 0
+    _shock_keys = [str(_e.get("shock_key", "")) for _e in loop_presets.get(preset_name, []) if _e.get("shock_key")]
+    _shock_months_all: list[pd.Timestamp] = []
+    for _k in _shock_keys:
+        _shock_months_all.extend([pd.Timestamp(x) for x in (shocks.get(_k, []) or [])])
+    _shock_months_uniq = sorted({pd.Timestamp(x).to_period("M").to_timestamp() for x in _shock_months_all})
+    _shock_n_unique = len(_shock_months_uniq)
+    if shock_month_override is not None:
+        _shock_label = pd.Timestamp(shock_month_override).strftime("%Y-%m")
+        _shock_mode = "Selected month"
+    else:
+        _shock_label = "Auto (top shocks)"
+        _shock_mode = f"Top {int(n_examples)} per direction"
+
+    # Count "pairs found" under current constraints (shock-month selection, stance/archetype, response fuzz).
+    # A "pair found" means: we can pick a shock paragraph for the direction AND a response paragraph within the
+    # response window (using the same anchor/overlap preference as the renderer).
+    _pairs_attempted = 0
+    _pairs_found = 0
+    _candidate_pairs = 0
+    for _edge in loop_presets.get(preset_name, []):
+        _lag = int(lags.get(str(_edge.get("lag_key")), 1))
+        if shock_month_override is not None:
+            _sms = [pd.Timestamp(shock_month_override)]
+        else:
+            _sms = [pd.Timestamp(x) for x in (shocks.get(str(_edge.get("shock_key")), []) or [])][:n_examples]
+        for _sm in _sms:
+            _pairs_attempted += 1
+            _imp = _loop_pick_paragraph(
+                df,
+                target_month=pd.Timestamp(_sm),
+                month_window=0,
+                archetype=str(_edge.get("imp_arch")),
+                target_stance=str(_edge.get("imp_stance")),
+                anchor_text=None,
+            )
+            if _imp is None:
+                continue
+            _anchor = str(_imp.get("paragraph")) if use_anchor else None
+            _resp_month = pd.Timestamp(_sm) + pd.DateOffset(months=int(_lag))
+            _candidate_pairs += _loop_count_candidates(
+                df,
+                target_month=pd.Timestamp(_resp_month),
+                month_window=resp_fuzz,
+                archetype=str(_edge.get("resp_arch")),
+                target_stance=str(_edge.get("resp_stance")),
+            )
+            _resp = _loop_pick_paragraph(
+                df,
+                target_month=pd.Timestamp(_resp_month),
+                month_window=resp_fuzz,
+                archetype=str(_edge.get("resp_arch")),
+                target_stance=str(_edge.get("resp_stance")),
+                anchor_text=_anchor,
+            )
+            if _resp is not None:
+                _pairs_found += 1
+
+    with st.container(key="ave_chips_dock_width"):
+        with st.container(border=True):
+            st.markdown(
+                f"""
+<div class="ave-loop-kpis">
+  <span class="ave-loop-kpi"><strong>Loop</strong> {html.escape(str(preset_name))}</span>
+  <span class="ave-loop-kpi"><strong>Directions</strong> {int(_edge_n)}</span>
+  <span class="ave-loop-kpi"><strong>Candidate pairs</strong> {int(_candidate_pairs)}</span>
+  <span class="ave-loop-kpi"><strong>Pairs shown</strong> {int(_pairs_found)} / {int(_pairs_attempted)}</span>
+  <span class="ave-loop-kpi"><strong>Shock mode</strong> {html.escape(str(_shock_label))}</span>
+  <span class="ave-loop-kpi"><strong>Response window</strong> ±{int(resp_fuzz)} month(s)</span>
+</div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                f"**Candidate pairs** counts how many response paragraphs exist inside the response window (± months) "
+                f"under the current archetype/stance constraints; this should increase as you widen fuzziness. "
+                f"**Pairs shown** counts how many attempts yield at least one valid shock paragraph and at least one valid response paragraph "
+                f"(so it can stay flat if responses already exist at the peak month). "
+                f"(Shock months available for this loop: {int(_shock_n_unique)} unique month(s).) "
+                "Cards stack vertically on narrow screens."
+            )
+
+            # Timeline: discourse volume by month + shock/response symbols (color = archetype).
+            d0 = pd.to_datetime(df.get("date"), errors="coerce")
+            vol = (
+                pd.DataFrame({"ym": d0.dropna().dt.to_period("M").astype(str)})
+                .groupby("ym")
+                .size()
+                .reset_index(name="n")
+            )
+            vol["month"] = pd.to_datetime(vol["ym"] + "-01", errors="coerce")
+            vol = vol.dropna(subset=["month"]).sort_values("month")
+
+            # Use the same set of shock attempts as the page (so the plot stays readable).
+            _pairs_for_plot: list[dict[str, object]] = []
+            for _edge in loop_presets.get(preset_name, []):
+                _lag = int(lags.get(str(_edge.get("lag_key")), 1))
+                if shock_month_override is not None:
+                    _sms = [pd.Timestamp(shock_month_override)]
+                else:
+                    _sms = [pd.Timestamp(x) for x in (shocks.get(str(_edge.get("shock_key")), []) or [])][:n_examples]
+                for _sm in _sms:
+                    _pairs_for_plot.append(
+                        {
+                            "shock_month": pd.Timestamp(_sm).to_period("M").to_timestamp(),
+                            "resp_month": (pd.Timestamp(_sm) + pd.DateOffset(months=int(_lag)))
+                            .to_period("M")
+                            .to_timestamp(),
+                            "shock_arch": str(_edge.get("imp_arch")),
+                            "resp_arch": str(_edge.get("resp_arch")),
+                            "edge": str(_edge.get("title", "")),
+                        }
+                    )
+            pairs_plot_df = pd.DataFrame(_pairs_for_plot)
+
+            if len(vol):
+                y_max = float(vol["n"].max() or 0.0)
+                y_shock = y_max * 1.06 if y_max else 1.0
+                y_resp = y_max * 1.16 if y_max else 1.2
+
+                # Icon palette (Pioneer=green, Guardian=blue, Builder=orange).
+                _arch_domain = ["Pioneer", "Guardian", "Builder"]
+                _arch_range = ["#2e7d32", "#1f4e79", "#d97706"]
+                _arch_scale = alt.Scale(domain=_arch_domain, range=_arch_range)
+
+                base = alt.Chart(vol).encode(x=alt.X("month:T", title=None))
+                bars = base.mark_bar(color="rgba(47, 74, 94, 0.18)").encode(
+                    y=alt.Y("n:Q", title="Paragraphs per month")
+                )
+
+                if len(pairs_plot_df):
+                    seg = pairs_plot_df.copy()
+                    seg["y"] = y_resp
+                    segs = alt.Chart(seg).mark_rule(color="rgba(31, 78, 121, 0.35)", strokeWidth=2).encode(
+                        x=alt.X("shock_month:T"),
+                        x2=alt.X2("resp_month:T"),
+                        y=alt.Y("y:Q", title=None),
+                        tooltip=[
+                            alt.Tooltip("edge:N", title="Direction"),
+                            alt.Tooltip("shock_month:T", title="Shock month"),
+                            alt.Tooltip("resp_month:T", title="Response month (T+lag)"),
+                        ],
+                    )
+
+                    shock_pts = pairs_plot_df.copy()
+                    shock_pts["kind"] = "Shock"
+                    shock_pts["month"] = shock_pts["shock_month"]
+                    shock_pts["archetype"] = shock_pts["shock_arch"]
+                    shock_pts["y"] = y_shock
+
+                    resp_pts = pairs_plot_df.copy()
+                    resp_pts["kind"] = "Response"
+                    resp_pts["month"] = resp_pts["resp_month"]
+                    resp_pts["archetype"] = resp_pts["resp_arch"]
+                    resp_pts["y"] = y_resp
+
+                    pts = pd.concat([shock_pts, resp_pts], ignore_index=True)
+                    points = (
+                        alt.Chart(pts)
+                        .mark_point(filled=True, size=85)
+                        .encode(
+                            x=alt.X("month:T", title=None),
+                            y=alt.Y("y:Q", title=None, scale=alt.Scale(domain=[0, y_resp * 1.08])),
+                            color=alt.Color("archetype:N", scale=_arch_scale, legend=alt.Legend(title="Archetype")),
+                            shape=alt.Shape(
+                                "kind:N",
+                                scale=alt.Scale(domain=["Shock", "Response"], range=["triangle-up", "circle"]),
+                                legend=alt.Legend(title="Marker"),
+                            ),
+                            tooltip=[
+                                alt.Tooltip("edge:N", title="Direction"),
+                                alt.Tooltip("kind:N", title="Type"),
+                                alt.Tooltip("archetype:N", title="Archetype"),
+                                alt.Tooltip("month:T", title="Month"),
+                            ],
+                        )
+                    )
+                    overlay = alt.layer(segs, points)
+                else:
+                    overlay = alt.Chart(pd.DataFrame({"month": [], "y": []})).mark_point().encode(
+                        x="month:T", y="y:Q"
+                    )
+
+                chart = (
+                    alt.layer(bars, overlay)
+                    .resolve_scale(y="shared")
+                    .properties(height=140)
+                    .configure_axis(labelColor="#334155", titleColor="#334155", gridColor="rgba(148,163,184,0.25)")
+                    .configure_legend(labelColor="#334155", titleColor="#334155")
+                )
+                st.altair_chart(chart, use_container_width=True)
 
     def _pair_html(imp_row: pd.Series | None, resp_row: pd.Series | None, *, lag: int) -> str:
         a = (
@@ -1172,16 +1456,33 @@ def _render_loop_pairs_page(df: pd.DataFrame, *, csv_path: str) -> None:
     for edge in loop_presets[preset_name]:
         edge_title = str(edge["title"])
         lag = int(lags.get(str(edge["lag_key"]), 1))
-        shock_months = [pd.Timestamp(x) for x in (shocks.get(str(edge["shock_key"]), []) or [])][:n_examples]
-        st.markdown(f"### {edge_title} · top {len(shock_months)} example(s) · lag T+{lag}")
+        if shock_month_override is not None:
+            shock_months = [pd.Timestamp(shock_month_override)]
+        else:
+            shock_months = [pd.Timestamp(x) for x in (shocks.get(str(edge["shock_key"]), []) or [])][:n_examples]
+        _n_lab = len(shock_months)
+        _which = "selected month" if shock_month_override is not None else f"top {_n_lab} example(s)"
+        _fuzz_lab = f" · response window ±{resp_fuzz}m" if resp_fuzz else ""
+        st.markdown(
+            f"""
+<div class="ave-loop-edge-head">
+  <div class="ave-loop-edge-title">{html.escape(edge_title)}</div>
+  <div class="ave-loop-edge-meta">{html.escape(_which)}</div>
+  <div class="ave-loop-edge-meta">lag T+{int(lag)}</div>
+  {f'<div class="ave-loop-edge-meta">±{int(resp_fuzz)}m</div>' if resp_fuzz else ''}
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
         if not shock_months:
             st.warning("No shock months available for this direction.")
             continue
 
-        for sm in shock_months:
+        for j, sm in enumerate(shock_months, start=1):
             imp = _loop_pick_paragraph(
                 df,
                 target_month=pd.Timestamp(sm),
+                month_window=0,
                 archetype=str(edge["imp_arch"]),
                 target_stance=str(edge["imp_stance"]),
                 anchor_text=None,
@@ -1191,13 +1492,22 @@ def _render_loop_pairs_page(df: pd.DataFrame, *, csv_path: str) -> None:
             resp = _loop_pick_paragraph(
                 df,
                 target_month=pd.Timestamp(resp_month),
+                month_window=resp_fuzz,
                 archetype=str(edge["resp_arch"]),
                 target_stance=str(edge["resp_stance"]),
                 anchor_text=anchor_text,
             )
+            if resp_fuzz:
+                resp_lo = (pd.Timestamp(resp_month) - pd.DateOffset(months=int(resp_fuzz))).strftime("%Y-%m")
+                resp_hi = (pd.Timestamp(resp_month) + pd.DateOffset(months=int(resp_fuzz))).strftime("%Y-%m")
+                resp_head = f"{pd.Timestamp(resp_month).strftime('%Y-%m')} (window {resp_lo} → {resp_hi})"
+            else:
+                resp_head = pd.Timestamp(resp_month).strftime("%Y-%m")
             st.markdown(
-                f"<div class='ave-loop-card-head'>Shock {pd.Timestamp(sm).strftime('%Y-%m')} "
-                f"→ Response {pd.Timestamp(resp_month).strftime('%Y-%m')}</div>",
+                f"<div class='ave-loop-card-head'>"
+                f"<span class='ave-loop-pair-badge'>{int(j)}</span>"
+                f"<span>Shock {pd.Timestamp(sm).strftime('%Y-%m')} → Response {resp_head}</span>"
+                f"</div>",
                 unsafe_allow_html=True,
             )
             _render_snippet_block(_pair_html(imp, resp, lag=lag))
@@ -2014,6 +2324,32 @@ def _inject_branding_css() -> None:
     margin: 0 0 0.45rem 0;
     padding: 0;
   }
+  /* Loop explorer: compact KPI pills under the top bar */
+  .ave-loop-kpis {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    align-items: center;
+    margin: 0.1rem 0 0.35rem 0;
+  }
+  .ave-loop-kpi {
+    display: inline-flex;
+    gap: 0.45rem;
+    align-items: baseline;
+    padding: 0.42rem 0.65rem;
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.55);
+    background: rgba(248, 250, 252, 0.95);
+    color: #1f2937;
+    font-size: 0.85rem;
+    line-height: 1.15;
+    white-space: nowrap;
+  }
+  .ave-loop-kpi strong {
+    color: #1f4e79;
+    font-weight: 800;
+    letter-spacing: 0.02em;
+  }
   /* Sidebar view switch (Explorer | Loop pairs): make it read as a mode toggle, not a filter. */
   section[data-testid="stSidebar"] [class*="st-key-ave_page"] {
     margin: 0.15rem 0 0.65rem 0 !important;
@@ -2408,12 +2744,18 @@ def _inject_branding_css() -> None:
   */
   .ave-snippet-grid.ave-snippet-grid-root {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(min(100%, 22rem), 1fr));
+    /* Cap to max 2 columns (Explorer used to be 2-up on wide screens). */
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 1.85rem 2rem;
     width: 100%;
     max-width: min(90rem, 100%);
     margin: 0 auto;
     box-sizing: border-box;
+  }
+  @media (max-width: 860px) {
+    .ave-snippet-grid.ave-snippet-grid-root {
+      grid-template-columns: 1fr;
+    }
   }
   /* Dedupe mode: explicit row gap between 2-up pairs (Streamlit ignores many margin hacks) */
   .ave-snippet-dedupe-pair-spacer {
@@ -2854,6 +3196,51 @@ def _inject_branding_css() -> None:
     color: #334155;
     font-size: 0.88rem;
     margin: 0 0 0.35rem 0;
+  }
+  .ave-loop-edge-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    align-items: baseline;
+    margin: 0.5rem 0 0.35rem 0;
+  }
+  .ave-loop-edge-title {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-weight: 800;
+    color: #1f4e79;
+    font-size: 1.02rem;
+    line-height: 1.1;
+  }
+  .ave-loop-edge-meta {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-weight: 650;
+    color: #475569;
+    font-size: 0.82rem;
+    background: rgba(248, 250, 252, 0.95);
+    border: 1px solid rgba(213, 218, 224, 0.9);
+    border-radius: 999px;
+    padding: 0.15rem 0.5rem;
+    white-space: nowrap;
+  }
+  .ave-loop-card-head {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+  }
+  .ave-loop-pair-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.5rem;
+    height: 1.5rem;
+    padding: 0 0.4rem;
+    border-radius: 10px;
+    background: #1f4e79;
+    color: #ffffff;
+    font-weight: 850;
+    font-size: 0.82rem;
+    line-height: 1;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.18);
   }
   .ave-loop-missing {
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -4391,6 +4778,33 @@ def main() -> None:
                     key="ave_loop_pairs_n_examples",
                     help="How many of the model’s strongest shock months to show for each direction.",
                 )
+                st.slider(
+                    "Response-month fuzziness (± months)",
+                    min_value=0,
+                    max_value=6,
+                    value=1,
+                    step=1,
+                    key="ave_loop_pairs_resp_month_fuzz",
+                    help="Widen the response search window around the model’s peak lag (T+lag). "
+                    "Example: fuzz=1 searches lag-1 … lag+1 months. Within the window we still prefer the closest month, "
+                    "then thematic overlap (if enabled).",
+                )
+                _dates = pd.to_datetime(df.get("date"), errors="coerce")
+                _months = (
+                    _dates.dropna()
+                    .dt.to_period("M")
+                    .drop_duplicates()
+                    .sort_values()
+                    .astype(str)
+                    .to_list()
+                )
+                st.selectbox(
+                    "Shock month (optional)",
+                    options=["Auto (top shocks)"] + _months,
+                    key="ave_loop_pairs_shock_month_label",
+                    help="Override the shock month to explore a specific episode. "
+                    "Auto uses the model’s strongest shock months per direction.",
+                )
                 st.checkbox(
                     "Prefer thematic overlap for the response",
                     value=True,
@@ -4632,7 +5046,7 @@ def main() -> None:
     with st.container(key="ave_expl_title_unified"):
         left, right = st.columns([7.5, 1.8], vertical_alignment="center")
         with left:
-            st.markdown(_explorer_title_bar_html(_icon_uri), unsafe_allow_html=True)
+            st.markdown(_explorer_title_bar_html(_icon_uri, title="AI Vision Explorer"), unsafe_allow_html=True)
         with right:
             if st.button("Explanations", key="ave_open_guide", use_container_width=True):
                 st.session_state[AVE_SHOW_GUIDE_KEY] = True
